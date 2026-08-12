@@ -1,0 +1,81 @@
+# Local development stack.
+#
+#   docker compose -f deploy/docker-compose.yml up --build      # HiveMCP only
+#   docker compose -f deploy/docker-compose.yml --profile owui up --build
+#
+# The second form additionally starts an OpenWebUI instance, which is what the M0
+# integration spikes need (Files-API ownership, Rich-UI rendering).
+
+name: hivemcp
+
+services:
+  hivemcp:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: hivemcp:0.1.0
+    ports:
+      - "8080:8080"
+    # Secrets live in ../.env, which .gitignore excludes. Nothing secret belongs in
+    # `environment:` below: this file is committed.
+    #
+    # Note the precedence, because it is a quiet trap: a key set in `environment:`
+    # WINS over the same key in env_file. Anything you expect to configure through
+    # .env must therefore not appear in the block below at all.
+    env_file:
+      - path: ../.env
+        required: false
+    environment:
+      # Non-secret defaults only.
+      #
+      # HIVE_OWUI_URL is deliberately NOT here. Pinning it to the bundled service name
+      # would override whatever you set in .env (see the precedence note above) and
+      # silently break every setup where OpenWebUI runs somewhere else. Set it in .env:
+      #   bundled openwebui service   -> http://openwebui:8080
+      #   OpenWebUI elsewhere on host -> http://host.docker.internal:3000
+      HIVE_ENVIRONMENT: dev
+      HIVE_LOG_LEVEL: INFO
+      HIVE_PUBLIC_URL: http://localhost:8080
+      HIVE_DATA_DIR: /data
+    extra_hosts:
+      # Lets the container reach services published on the host. Docker Desktop provides
+      # this name automatically; on plain Linux Docker it has to be declared.
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Named volume, not a bind mount: the container runs as uid 10001 and a host
+      # directory would arrive owned by your user, so every write would fail.
+      - hivemcp-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=4).status==200 else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  openwebui:
+    profiles: ["owui"]
+    image: ghcr.io/open-webui/open-webui:main
+    ports:
+      - "3000:8080"
+    environment:
+      # Without this, OAuth-connected MCP tools break on every restart with
+      # "Error decrypting tokens" and have to be re-authorised.
+      WEBUI_SECRET_KEY: dev-secret-key-not-for-production
+      # Exposes Swagger at /docs, which makes the Files-API spike far easier.
+      ENV: dev
+      # Global master switch for API keys. With it off, the "API Keys" section does not
+      # appear in Settings -> Account at all, which looks like a missing feature rather
+      # than a disabled one. HiveMCP needs a key to upload files back into the chat.
+      ENABLE_API_KEYS: "true"
+    volumes:
+      - openwebui-data:/app/backend/data
+    restart: unless-stopped
+
+volumes:
+  hivemcp-data:
+  openwebui-data:
