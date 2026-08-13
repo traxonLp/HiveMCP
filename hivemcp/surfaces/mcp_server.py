@@ -33,13 +33,15 @@ import logging
 from typing import Any
 
 from mcp.server.mcpserver import Context, MCPServer
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp
 
-from ..auth import Identity, identity_from_headers, verify_bearer
+from ..auth import AuthError, Caller, SessionValidator, authenticate
 from ..config import Settings
 from ..core.models import DeckSpec, DocSpec, RenderOptions, SheetSpec
 from ..core.render.base import RenderError
 from ..core.service import DocumentService, ToolError
+from ..core.templates.service import TemplateService
+from ..core.templates.store import TemplateError, TemplateKind
 
 logger = logging.getLogger(__name__)
 
@@ -56,20 +58,25 @@ when a requested font is one their viewer may not have installed.\
 """
 
 
-def _identity_from_context(ctx: Context | None) -> Identity:
-    """Recover the caller from the underlying HTTP request.
+async def _caller_from_context(validator: SessionValidator, ctx: Context | None) -> Caller:
+    """Authenticate the caller from the underlying HTTP request.
 
-    OpenWebUI fills X-Hive-* headers from its own template tokens. If anything about
-    the transport changes and the request is not reachable, degrade to anonymous rather
-    than failing the call: identity drives template visibility and quotas, not access.
+    No anonymous fallback: the session token is both the proof of identity and the
+    credential used to act on the user's behalf, so a call without one cannot be served
+    at all.
     """
     try:
         request = ctx.request_context.request  # type: ignore[union-attr]
         headers = request.headers  # type: ignore[union-attr]
-    except Exception:  # noqa: BLE001
-        logger.debug("no HTTP request on the MCP context; treating caller as anonymous")
-        return Identity()
-    return identity_from_headers(headers)
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(
+            "This tool needs an OpenWebUI chat session, and no HTTP request context was "
+            "available on this call."
+        ) from exc
+    try:
+        return await authenticate(validator, headers)
+    except AuthError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _fail(exc: Exception) -> Exception:
@@ -77,11 +84,15 @@ def _fail(exc: Exception) -> Exception:
     return ValueError(str(exc))
 
 
-def build_mcp_server(service: DocumentService) -> MCPServer:
+def build_mcp_server(
+    service: DocumentService,
+    validator: SessionValidator,
+    templates: TemplateService,
+) -> MCPServer:
     # Name stays positional, everything else by keyword: v2 inserted `title` and
     # `description` before `instructions`, so a positional second argument silently
     # lands in `title` and the instructions never reach the model.
-    mcp = MCPServer("HiveMCP", instructions=INSTRUCTIONS, version="0.1.0")
+    mcp = MCPServer("HiveMCP", instructions=INSTRUCTIONS, version="1.0.0")
 
     @mcp.tool(
         name="hive_create_presentation",
@@ -98,8 +109,9 @@ def build_mcp_server(service: DocumentService) -> MCPServer:
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         try:
+            caller = await _caller_from_context(validator, ctx)
             result = await service.create_presentation(
-                _identity_from_context(ctx), options=options, spec=spec, brief=brief
+                caller, options=options, spec=spec, brief=brief
             )
         except (ToolError, RenderError) as exc:
             raise _fail(exc) from exc
@@ -119,8 +131,9 @@ def build_mcp_server(service: DocumentService) -> MCPServer:
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         try:
+            caller = await _caller_from_context(validator, ctx)
             result = await service.create_document(
-                _identity_from_context(ctx), options=options, spec=spec, brief=brief
+                caller, options=options, spec=spec, brief=brief
             )
         except (ToolError, RenderError) as exc:
             raise _fail(exc) from exc
@@ -140,62 +153,93 @@ def build_mcp_server(service: DocumentService) -> MCPServer:
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         try:
+            caller = await _caller_from_context(validator, ctx)
             result = await service.create_spreadsheet(
-                _identity_from_context(ctx), options=options, spec=spec, brief=brief
+                caller, options=options, spec=spec, brief=brief
             )
         except (ToolError, RenderError) as exc:
             raise _fail(exc) from exc
         return result.model_dump(exclude_none=True)
 
+    @mcp.tool(
+        name="hive_list_templates",
+        description=(
+            "List the shared document templates, optionally filtered by kind ('pptx', "
+            "'docx' or 'xlsx'). Everyone can use these; only administrators add them."
+        ),
+    )
+    async def list_templates(
+        kind: TemplateKind | None = None, ctx: Context | None = None
+    ) -> dict[str, Any]:
+        caller = await _caller_from_context(validator, ctx)
+        return {"templates": templates.list(caller, kind)}
+
+    @mcp.tool(
+        name="hive_inspect_template",
+        description=(
+            "Report a template's layouts, styles and {{placeholders}} so a spec can be "
+            "built to match it. Call this before generating with a template: it tells "
+            "you which layout names exist and which spec layout each one maps to."
+        ),
+    )
+    async def inspect_template(
+        template_id: str, ctx: Context | None = None
+    ) -> dict[str, Any]:
+        caller = await _caller_from_context(validator, ctx)
+        try:
+            return templates.inspect(caller, template_id)
+        except TemplateError as exc:
+            raise _fail(exc) from exc
+
+    @mcp.tool(
+        name="hive_upload_template",
+        description=(
+            "Save a file the user attached to this chat as a reusable template. "
+            "Administrators only: templates are a shared pool everyone can use. Returns "
+            "the same report as hive_inspect_template."
+        ),
+    )
+    async def upload_template(
+        file_id: str,
+        name: str,
+        filename: str | None = None,
+        description: str | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        caller = await _caller_from_context(validator, ctx)
+        try:
+            return await templates.upload_from_chat(
+                caller,
+                file_id=file_id,
+                name=name,
+                filename=filename,
+                description=description,
+            )
+        except TemplateError as exc:
+            raise _fail(exc) from exc
+
+    @mcp.tool(
+        name="hive_delete_template",
+        description="Delete a template from the shared pool. Administrators only.",
+    )
+    async def delete_template(
+        template_id: str, ctx: Context | None = None
+    ) -> dict[str, Any]:
+        caller = await _caller_from_context(validator, ctx)
+        try:
+            templates.delete(caller, template_id)
+        except TemplateError as exc:
+            raise _fail(exc) from exc
+        return {"deleted": template_id}
+
     return mcp
 
 
-class BearerAuthMiddleware:
-    """Bearer check for the mounted MCP app.
-
-    FastAPI dependencies do not reach into a mounted sub-application, so the same check
-    the OpenAPI surface gets from ``require_caller`` is applied here as raw ASGI.
-    """
-
-    def __init__(self, app: ASGIApp, settings: Settings) -> None:
-        self.app = app
-        self.settings = settings
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or not self.settings.auth_enabled:
-            await self.app(scope, receive, send)
-            return
-
-        header = None
-        for key, value in scope.get("headers", []):
-            if key.lower() == b"authorization":
-                header = value.decode("latin-1")
-                break
-
-        try:
-            verify_bearer(header, self.settings)
-        except Exception as exc:  # noqa: BLE001 - HTTPException or anything else
-            detail = getattr(exc, "detail", "Unauthorized")
-            body = f'{{"error":"unauthorized","detail":"{detail}"}}'.encode()
-            await send(
-                {
-                    "type": "http.response.start",
-                    "status": 401,
-                    "headers": [
-                        (b"content-type", b"application/json"),
-                        (b"www-authenticate", b"Bearer"),
-                        (b"content-length", str(len(body)).encode()),
-                    ],
-                }
-            )
-            await send({"type": "http.response.body", "body": body})
-            return
-
-        await self.app(scope, receive, send)
-
-
 def build_mcp_asgi_app(mcp: MCPServer, settings: Settings) -> ASGIApp:
-    app = mcp.streamable_http_app(
+    # No auth middleware here. Authentication happens inside each tool, because the
+    # session token is not only a gate but the credential the tool acts with, so it has
+    # to reach the handler rather than be checked and discarded at the edge.
+    return mcp.streamable_http_app(
         # Serve at the mount root; app.py mounts this under /mcp.
         streamable_http_path="/",
         # No session affinity needed across replicas.
@@ -210,4 +254,3 @@ def build_mcp_asgi_app(mcp: MCPServer, settings: Settings) -> ASGIApp:
         # that quickly (base64 inflates by 4/3), so this follows our own upload limit.
         max_request_body_size=settings.max_upload_bytes,
     )
-    return BearerAuthMiddleware(app, settings)

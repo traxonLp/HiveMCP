@@ -8,19 +8,20 @@ set -euo pipefail
 
 BASE="${1:-http://localhost:8080}"
 
-# Pick up HIVE_AUTH_TOKEN from .env so the script works without exporting it by hand.
-ENV_FILE="$(dirname "$0")/../.env"
-if [[ -f "$ENV_FILE" ]] && [[ -z "${HIVE_AUTH_TOKEN:-}" ]]; then
-    HIVE_AUTH_TOKEN="$(sed -n 's/^HIVE_AUTH_TOKEN=//p' "$ENV_FILE" | tail -1)"
-fi
+# Tool calls need a real OpenWebUI session token, which this script cannot mint. Export
+# one to exercise the tool endpoints end to end:
+#
+#   HIVE_SESSION_TOKEN=$(...) ./deploy/smoke.sh
+#
+# Without it the tool checks are skipped and only the unauthenticated surface is checked.
 
 # The array is seeded with a real header rather than left empty, because macOS still
 # ships bash 3.2, where expanding an empty array under `set -u` is an "unbound variable"
 # error. Later bash versions allow it. The header also makes these requests easy to spot
 # in `make logs`.
 CURL_ARGS=(-H "X-Hive-Smoke: 1")
-if [[ -n "${HIVE_AUTH_TOKEN:-}" ]]; then
-    CURL_ARGS+=(-H "Authorization: Bearer ${HIVE_AUTH_TOKEN}")
+if [[ -n "${HIVE_SESSION_TOKEN:-}" ]]; then
+    CURL_ARGS+=(-H "Authorization: Bearer ${HIVE_SESSION_TOKEN}")
 fi
 
 pass=0
@@ -109,6 +110,13 @@ else
 fi
 
 echo
+if [[ -z "${HIVE_SESSION_TOKEN:-}" ]]; then
+    echo "-- end to end: skipped (set HIVE_SESSION_TOKEN to a real OpenWebUI session)"
+    echo
+    printf '\033[32m%d passed, 0 failed (tool checks skipped)\033[0m\n' "$pass"
+    exit 0
+fi
+
 echo "-- end to end: generate a real .pptx"
 result="$(curl -sS -X POST "${CURL_ARGS[@]}" \
     -H 'Content-Type: application/json' \

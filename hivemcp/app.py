@@ -3,10 +3,13 @@
 The app hosts several surfaces over one shared core:
 
 * ``/healthz``, ``/readyz`` — Kubernetes probes
-* ``/d/{token}``           — signed artifact download (the R1 fallback delivery path)
+* ``/d/{token}``           — signed artifact download
 * ``/mcp``                 — MCP Streamable HTTP  (milestone M3)
 * ``/tools/*``             — OpenAPI tool server  (milestone M3)
 * ``/ui/*``                — configuration GUI    (milestone M5)
+
+Callers authenticate with their own OpenWebUI session token; HiveMCP holds no service
+credentials of its own. See ``auth.py``.
 """
 
 from __future__ import annotations
@@ -19,14 +22,17 @@ from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import FileResponse, JSONResponse
 
-from .auth import SignatureError, verify_ui_token
+from .auth import SessionValidator, SignatureError, verify_ui_token
 from .config import Settings, get_settings
 from .core.delivery import CompositeDelivery, OwuiDelivery, SignedUrlDelivery
 from .core.files.owui_client import OwuiFilesClient
 from .core.files.workdir import ArtifactStore
 from .core.llm.client import OwuiChatClient
+from .core.preferences_client import PreferencesClient
 from .core.render.base import RenderError
 from .core.service import DocumentService
+from .core.templates.service import TemplateService
+from .core.templates.store import TemplateStore
 from .surfaces.mcp_server import build_mcp_asgi_app, build_mcp_server
 from .surfaces.openapi_tools import router as tools_router
 
@@ -56,9 +62,9 @@ async def _sweep_loop(store: ArtifactStore) -> None:
 def _build_delivery(settings: Settings, store: ArtifactStore, owui: OwuiFilesClient):  # noqa: ANN202
     """Choose how finished documents reach the user.
 
-    With OpenWebUI configured the upload is primary and a signed link is attached as
-    well, so a document is still reachable if the upload lands on the service account
-    rather than the user (plan risk R1). Without it, links are all there is.
+    The upload runs with the caller's own session token, so the file lands in their file
+    list. A signed link is attached as well, so the model has a URL for its reply and a
+    failed upload still yields the document.
     """
     signed = SignedUrlDelivery(settings, store)
     if not owui.configured:
@@ -71,9 +77,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     _configure_logging(settings)
 
     store = ArtifactStore(settings.tmp_dir, settings.tmp_ttl_minutes)
+    validator = SessionValidator(
+        settings.owui_url,
+        timeout=settings.owui_timeout_seconds,
+        cache_ttl=settings.session_cache_ttl_seconds,
+        cache_max=settings.session_cache_max_entries,
+    )
     owui = OwuiFilesClient(
         settings.owui_url,
-        settings.owui_api_key,
         timeout=settings.owui_timeout_seconds,
         max_bytes=settings.max_upload_bytes,
     )
@@ -81,14 +92,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # and sharing one would either cut generation short or leave uploads hanging.
     chat = OwuiChatClient(
         settings.owui_url,
-        settings.owui_api_key,
         timeout=settings.llm_timeout_seconds,
         max_output_tokens=settings.llm_max_output_tokens,
     )
-    service = DocumentService(settings, _build_delivery(settings, store, owui), owui, chat)
+    preferences = PreferencesClient(settings.owui_url)
+    templates = TemplateService(settings, TemplateStore(settings.templates_dir), owui)
+    service = DocumentService(
+        settings, _build_delivery(settings, store, owui), owui, chat, templates
+    )
 
     # Built before the app so the session manager exists by the time the lifespan runs.
-    mcp = build_mcp_server(service)
+    mcp = build_mcp_server(service, validator, templates)
     mcp_app = build_mcp_asgi_app(mcp, settings)
 
     @asynccontextmanager
@@ -96,8 +110,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         settings.ensure_dirs()
         app.state.settings = settings
         app.state.store = store
+        app.state.validator = validator
         app.state.owui = owui
         app.state.chat = chat
+        app.state.preferences = preferences
+        app.state.templates = templates
         app.state.service = service
         app.state.mcp = mcp
 
@@ -107,11 +124,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await stack.enter_async_context(mcp.session_manager.run())
             sweeper = asyncio.create_task(_sweep_loop(store))
             logger.info(
-                "HiveMCP started (env=%s, auth=%s, owui=%s, brief_mode=%s, "
+                "HiveMCP started (env=%s, auth=session-token, owui=%s, brief_mode=%s, "
                 "mcp=/mcp, tools=/tools)",
                 settings.environment,
-                "on" if settings.auth_enabled else "off",
-                "configured" if owui.configured else "not configured",
+                settings.owui_url or "NOT CONFIGURED - nothing can authenticate",
                 "on (uses the model selected in the chat)"
                 if settings.llm_enabled
                 else "off (spec only)",
@@ -124,10 +140,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     await sweeper
                 await owui.aclose()
                 await chat.aclose()
+                await validator.aclose()
+                await preferences.aclose()
 
     app = FastAPI(
         title="HiveMCP",
-        version="0.1.0",
+        version="1.0.0",
         description=(
             "Generates and edits PowerPoint, Word and Excel files for OpenWebUI. "
             "Exposed both as an MCP Streamable HTTP server and as an OpenAPI tool server."
@@ -139,6 +157,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     _register_health(app, settings)
     _register_download(app)
     app.include_router(tools_router)
+
+    if settings.environment == "dev":
+        # Reflects request headers back to the caller, which is exactly what the M0
+        # spikes need and exactly what must never be reachable in production.
+        from .surfaces.debug import router as debug_router
+
+        app.include_router(debug_router)
+        logger.info(
+            "dev diagnostics mounted under /_debug: whoami, settings-probe, "
+            "upload-check, richui"
+        )
+
     app.mount("/mcp", mcp_app)
     return app
 
@@ -149,7 +179,9 @@ def _register_error_handlers(app: FastAPI) -> None:
         # 422, not 500: the spec was the problem, and the model can fix it and retry.
         # The message is written to be actionable, so it is passed through verbatim.
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            # Literal, not a Starlette constant: the name for this code changed between
+            # versions and either spelling warns on the other side of the rename.
+            status_code=422,
             content={"error": "render_failed", "detail": str(exc)},
         )
 

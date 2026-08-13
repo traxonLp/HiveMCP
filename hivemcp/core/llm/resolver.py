@@ -5,9 +5,10 @@ template, and the ``__model__`` reserved argument is delivered to native Python 
 only. So the model is recovered in order of decreasing reliability:
 
 1. ``X-Hive-Model`` on the connection, if an admin pinned one.
-2. A lookup of the chat named by ``{{CHAT_ID}}``. This is the path that genuinely
-   follows the user's selection, and it works whenever the service API key can read
-   the chat — always in a single-user install.
+2. A lookup of the chat named by ``{{CHAT_ID}}``, using the caller's own session token.
+   This is the path that genuinely follows the user's selection, and since the token
+   belongs to the user, it reads their chat rather than depending on a service account
+   having permission to.
 3. ``HIVE_LLM_FALLBACK_MODEL``, if configured.
 
 Step 3 is deliberately opt-in and empty by default: silently answering with a different
@@ -19,7 +20,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from ...auth import Identity
+from ...auth import Caller
 from ...config import Settings
 from .client import OwuiChatClient
 
@@ -54,13 +55,14 @@ class ModelUnavailable(Exception):
 
 
 async def resolve_model(
-    client: OwuiChatClient, settings: Settings, identity: Identity
+    client: OwuiChatClient, settings: Settings, caller: Caller
 ) -> ResolvedModel:
+    identity = caller.identity
     if identity.model:
         return ResolvedModel(identity.model, "header")
 
     if identity.chat_id:
-        found = await client.get_chat_model(identity.chat_id)
+        found = await client.get_chat_model(identity.chat_id, caller.token)
         if found:
             return ResolvedModel(found, "chat")
         logger.info(

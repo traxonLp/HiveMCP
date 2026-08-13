@@ -18,7 +18,7 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
-from ...auth import Identity
+from ...auth import Caller
 from ...config import Settings
 from ..models import RenderOptions
 from .client import LlmError, OwuiChatClient
@@ -110,7 +110,7 @@ def _format_errors(exc: ValidationError, limit: int = 12) -> str:
 async def expand_brief(
     client: OwuiChatClient,
     settings: Settings,
-    identity: Identity,
+    caller: Caller,
     model: str,
     brief: str,
     options: RenderOptions,
@@ -131,7 +131,7 @@ async def expand_brief(
 
     for attempt in range(settings.llm_max_repair_attempts + 1):
         try:
-            reply = await client.complete(model, messages)
+            reply = await client.complete(model, messages, caller.token)
         except LlmError as exc:
             raise ExpansionError(str(exc)) from exc
 
@@ -149,7 +149,7 @@ async def expand_brief(
             "brief expansion attempt %d with %s failed for user %s: %s",
             attempt + 1,
             model,
-            identity.user_id,
+            caller.identity.user_id,
             problem,
         )
         if attempt == settings.llm_max_repair_attempts:

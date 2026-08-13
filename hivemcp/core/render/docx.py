@@ -54,7 +54,11 @@ class DocxRenderer:
         self.image_resolver = image_resolver
         self.template_path = template_path
         self.warnings = RenderWarnings()
-        self.font = check_font(getattr(options, "font_family", None), self.warnings)
+        self.font = check_font(
+            getattr(options, "font_family", None),
+            self.warnings,
+            getattr(options, "language", "en"),
+        )
         self._character_count = 0
 
     # ---------------------------------------------------------------- public

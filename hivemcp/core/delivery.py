@@ -1,10 +1,9 @@
 """How a rendered file reaches the user.
 
-Two strategies behind one interface, because which one works is an open question
-(plan risk R1): uploading through the OpenWebUI Files API with a service API key may
-attach the file to the service account rather than to the person chatting. Keeping
-both behind ``Delivery`` means the answer to that spike is a config change rather
-than a refactor.
+Upload through the OpenWebUI Files API with the caller's own session token, so the
+document lands in *their* file list. A signed download link is minted alongside it, not
+as a fallback for ownership — that problem is gone — but so the model has a URL it can
+put directly in its reply.
 """
 
 from __future__ import annotations
@@ -12,7 +11,7 @@ from __future__ import annotations
 import logging
 from typing import Protocol
 
-from ..auth import Identity, sign_ui_token
+from ..auth import Caller, sign_ui_token
 from ..config import Settings
 from .files.owui_client import OwuiFilesClient
 from .files.workdir import ArtifactStore
@@ -35,24 +34,20 @@ class DeliveryResult:
 
 
 class Delivery(Protocol):
-    async def deliver(self, rendered: RenderedFile, identity: Identity) -> DeliveryResult: ...
+    async def deliver(self, rendered: RenderedFile, caller: Caller) -> DeliveryResult: ...
 
 
 class SignedUrlDelivery:
-    """Store on the PVC, hand back a signed, expiring URL.
-
-    Needs no OpenWebUI credentials, which makes it the dependable fallback and the
-    right default for local development.
-    """
+    """Store on the PVC, hand back a signed, expiring URL."""
 
     def __init__(self, settings: Settings, store: ArtifactStore) -> None:
         self.settings = settings
         self.store = store
 
-    async def deliver(self, rendered: RenderedFile, identity: Identity) -> DeliveryResult:
+    async def deliver(self, rendered: RenderedFile, caller: Caller) -> DeliveryResult:
         artifact = self.store.put(rendered.data, rendered.filename)
         token = sign_ui_token(
-            {"artifact_id": artifact.artifact_id, "user_id": identity.user_id},
+            {"artifact_id": artifact.artifact_id, "user_id": caller.identity.user_id},
             self.settings,
         )
         return DeliveryResult(
@@ -61,53 +56,51 @@ class SignedUrlDelivery:
 
 
 class OwuiDelivery:
-    """Upload through the OpenWebUI Files API so the file lands in the user's list."""
+    """Upload as the calling user, so the file appears in their own file list."""
 
     def __init__(self, client: OwuiFilesClient) -> None:
         self.client = client
 
-    async def deliver(self, rendered: RenderedFile, identity: Identity) -> DeliveryResult:
+    async def deliver(self, rendered: RenderedFile, caller: Caller) -> DeliveryResult:
         file_id = await self.client.upload(
-            rendered.data, rendered.filename, rendered.media_type
+            rendered.data, rendered.filename, rendered.media_type, caller.token
         )
         logger.info(
             "uploaded %s (%d bytes) to OpenWebUI as %s for user %s",
             rendered.filename,
             rendered.size_bytes,
             file_id,
-            identity.user_id,
+            caller.identity.user_id,
         )
         return DeliveryResult(file_id=file_id)
 
 
 class CompositeDelivery:
-    """Try the primary strategy, fall back to the secondary on failure.
+    """Upload, and attach a download link either way.
 
-    A failed upload should degrade to a download link, not lose the document the user
-    just waited for.
+    A failed upload must still hand the user the document they just waited for, and a
+    successful one is more useful with a link the model can paste into its reply.
     """
 
     def __init__(self, primary: Delivery, fallback: Delivery) -> None:
         self.primary = primary
         self.fallback = fallback
 
-    async def deliver(self, rendered: RenderedFile, identity: Identity) -> DeliveryResult:
+    async def deliver(self, rendered: RenderedFile, caller: Caller) -> DeliveryResult:
         try:
-            result = await self.primary.deliver(rendered, identity)
+            result = await self.primary.deliver(rendered, caller)
         except Exception as exc:  # noqa: BLE001 - any failure must still yield a file
-            logger.warning("primary delivery failed, falling back: %s", exc, exc_info=True)
-            result = await self.fallback.deliver(rendered, identity)
+            logger.warning("upload failed, falling back to a link: %s", exc, exc_info=True)
+            result = await self.fallback.deliver(rendered, caller)
             result.warnings.append(
-                "Upload to OpenWebUI failed; the file is available via the download link "
-                "instead."
+                "The file could not be added to your OpenWebUI files, so it is available "
+                "via the download link instead."
             )
             return result
 
-        # Belt and braces: also mint a link, so the user has a route to the file even
-        # if it is not visible in their OpenWebUI file list (see plan risk R1).
         try:
-            extra = await self.fallback.deliver(rendered, identity)
+            extra = await self.fallback.deliver(rendered, caller)
             result.download_url = extra.download_url
         except Exception:  # noqa: BLE001
-            logger.debug("secondary delivery link could not be created", exc_info=True)
+            logger.debug("could not mint a download link", exc_info=True)
         return result

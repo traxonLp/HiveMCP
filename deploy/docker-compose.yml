@@ -13,7 +13,7 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
-    image: hivemcp:0.1.0
+    image: hivemcp:1.0.0
     ports:
       - "8080:8080"
     # Secrets live in ../.env, which .gitignore excludes. Nothing secret belongs in
@@ -37,6 +37,10 @@ services:
       HIVE_LOG_LEVEL: INFO
       HIVE_PUBLIC_URL: http://localhost:8080
       HIVE_DATA_DIR: /data
+      # Separate volume: templates are curated and long-lived, artifacts churn and are
+      # swept on a TTL. Keeping them apart means `make clean` does not take the
+      # templates with it.
+      HIVE_TEMPLATES_DIR: /templates
     extra_hosts:
       # Lets the container reach services published on the host. Docker Desktop provides
       # this name automatically; on plain Linux Docker it has to be declared.
@@ -45,6 +49,7 @@ services:
       # Named volume, not a bind mount: the container runs as uid 10001 and a host
       # directory would arrive owned by your user, so every write would fail.
       - hivemcp-data:/data
+      - hivemcp-templates:/templates
     healthcheck:
       test:
         - CMD
@@ -78,4 +83,5 @@ services:
 
 volumes:
   hivemcp-data:
+  hivemcp-templates:
   openwebui-data:

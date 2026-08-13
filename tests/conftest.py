@@ -4,6 +4,7 @@ import base64
 
 import pytest
 
+from hivemcp.auth import Caller, Identity
 from hivemcp.config import Settings
 from hivemcp.core.models import (
     Bullet,
@@ -42,12 +43,23 @@ def options() -> RenderOptions:
 
 @pytest.fixture
 def settings(tmp_path) -> Settings:
+    # _env_file=None so a developer's real .env cannot leak into a test run.
     return Settings(
         environment="dev",
         data_dir=tmp_path,
-        auth_token="test-token",
         signing_key="test-signing-key",
         public_url="http://testserver",
+        owui_url="http://owui:8080",
+        _env_file=None,
+    )
+
+
+@pytest.fixture
+def caller() -> Caller:
+    """An authenticated caller, as produced by validating a session token."""
+    return Caller(
+        identity=Identity(user_id="u-1", email="j@example.com", role="user"),
+        token="session-token",
     )
 
 

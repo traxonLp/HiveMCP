@@ -12,7 +12,8 @@ env: ## Create .env from the template and generate a signing key
 	@key=$$(python3 -c "import secrets; print(secrets.token_urlsafe(32))"); \
 	  sed -i.bak "s|^HIVE_SIGNING_KEY=.*|HIVE_SIGNING_KEY=$$key|" .env && rm -f .env.bak
 	@echo "Wrote .env with a fresh HIVE_SIGNING_KEY (git-ignored)."
-	@echo "Next: add HIVE_OWUI_API_KEY from OpenWebUI (Settings -> Account -> API Keys)."
+	@echo "Next: check HIVE_OWUI_URL points at your OpenWebUI, then set that"
+	@echo "connection's authentication to 'Session' in OpenWebUI."
 
 check-secrets: ## Fail if anything credential-shaped is tracked by git
 	@hits=$$(git grep -nIE 'sk-[A-Za-z0-9_-]{16,}' -- ':!*.example' ':!docs/*' || true); \

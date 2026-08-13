@@ -34,6 +34,27 @@ SAFE_FONTS = frozenset(
     }
 )
 
+# Fonts with CJK coverage that ship with Office or the operating system. Smaller than the
+# Latin set because cross-platform CJK coverage genuinely is: Windows and macOS overlap
+# barely at all here.
+CJK_FONTS = frozenset(
+    {
+        "Microsoft YaHei",
+        "Microsoft JhengHei",
+        "SimSun",
+        "SimHei",
+        "PMingLiU",
+        "PingFang SC",
+        "PingFang TC",
+        "Songti SC",
+        "Noto Sans CJK SC",
+        "Noto Sans CJK TC",
+    }
+)
+
+# Languages written in scripts that a Latin-only font cannot cover.
+CJK_LANGUAGES = ("zh", "ja", "ko")
+
 DEFAULT_MONO_FONT = "Consolas"
 
 _HEX_COLOR = re.compile(r"^[0-9A-Fa-f]{6}$")
@@ -64,14 +85,28 @@ class RenderWarnings(list):
             self.append(message)
 
 
-def check_font(font_family: str | None, warnings: RenderWarnings) -> str | None:
+def check_font(
+    font_family: str | None, warnings: RenderWarnings, language: str = "en"
+) -> str | None:
     if not font_family:
         return None
-    if font_family not in SAFE_FONTS:
+
+    if font_family not in SAFE_FONTS and font_family not in CJK_FONTS:
         warnings.add(
             f"Font {font_family!r} is not in the set of fonts that ship with Office by "
             "default. If it is not installed on the reader's machine, their viewer will "
             "substitute a different one."
+        )
+
+    # A Latin-only font on Chinese, Japanese or Korean text still renders, because the
+    # viewer substitutes glyph by glyph. It just renders in a second, unchosen typeface,
+    # which is the kind of result that looks like a bug in the document rather than in
+    # the font choice.
+    if language.split("-")[0].lower() in CJK_LANGUAGES and font_family not in CJK_FONTS:
+        warnings.add(
+            f"Font {font_family!r} has no {language} glyphs, so that text will be shown "
+            "in whatever font the reader's viewer substitutes. Consider a font with CJK "
+            f"coverage instead: {', '.join(sorted(CJK_FONTS)[:4])}."
         )
     return font_family
 

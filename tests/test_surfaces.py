@@ -13,6 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from hivemcp.app import create_app
+from hivemcp.auth import Identity
 from hivemcp.config import Settings
 
 EXPECTED_TOOLS = {
@@ -27,21 +28,33 @@ MINIMAL_DECK = {
 }
 
 
+SESSION = {"Authorization": "Bearer session-token", "X-Hive-Chat-Id": "c-1"}
+
+
+class FakeValidator:
+    """Stands in for OpenWebUI when validating session tokens.
+
+    The surfaces are what is under test here; whether OpenWebUI answers correctly is
+    covered in test_auth.py.
+    """
+
+    def __init__(self, identity: Identity | None = None) -> None:
+        self.identity = identity or Identity(user_id="u-1", email="j@example.com")
+        self.seen: list[str] = []
+
+    async def validate(self, token: str) -> Identity:
+        self.seen.append(token)
+        return self.identity
+
+
 @pytest.fixture
 def client(settings: Settings):
+    """Authenticated client. There is no 'auth disabled' mode any more: a call without a
+    session token cannot be served, because the token is also the credential the tools
+    act with."""
     with TestClient(create_app(settings)) as test_client:
+        test_client.app.state.validator = FakeValidator()
         yield test_client
-
-
-@pytest.fixture
-def open_client(settings: Settings):
-    """An app with auth disabled, for exercising the happy paths."""
-    with TestClient(create_app(settings.model_copy(update={"auth_token": None}))) as c:
-        yield c
-
-
-AUTH = {"Authorization": "Bearer test-token"}
-IDENTITY = {"X-Hive-User-Id": "u-1", "X-Hive-Groups": "platform,admins"}
 
 
 # --------------------------------------------------------------------------- #
@@ -72,13 +85,18 @@ def test_health_routes_stay_out_of_the_tool_schema(client: TestClient) -> None:
     assert not {"/healthz", "/readyz"} & set(paths)
 
 
-def test_tool_call_requires_the_bearer_token(client: TestClient) -> None:
-    assert client.post("/tools/create_presentation", json=MINIMAL_DECK).status_code == 401
+def test_tool_call_requires_a_session_token(client: TestClient) -> None:
+    """No token, no service. A service-account fallback would put files back under the
+    wrong owner, which is what this design removes."""
+    response = client.post("/tools/create_presentation", json=MINIMAL_DECK)
+
+    assert response.status_code == 401
+    assert "Session" in response.json()["detail"], "the message should say how to fix it"
 
 
-def test_tool_call_round_trip(open_client: TestClient) -> None:
-    response = open_client.post(
-        "/tools/create_presentation", json=MINIMAL_DECK, headers=IDENTITY
+def test_tool_call_round_trip(client: TestClient) -> None:
+    response = client.post(
+        "/tools/create_presentation", json=MINIMAL_DECK, headers=SESSION
     )
 
     assert response.status_code == 200, response.text
@@ -89,13 +107,13 @@ def test_tool_call_round_trip(open_client: TestClient) -> None:
     assert body["download_url"].startswith("http://testserver/d/")
 
 
-def test_generated_file_can_actually_be_downloaded(open_client: TestClient) -> None:
+def test_generated_file_can_actually_be_downloaded(client: TestClient) -> None:
     """End to end: render, deliver, then follow the link the model was handed."""
-    body = open_client.post(
-        "/tools/create_presentation", json=MINIMAL_DECK, headers=IDENTITY
+    body = client.post(
+        "/tools/create_presentation", json=MINIMAL_DECK, headers=SESSION
     ).json()
 
-    downloaded = open_client.get(body["download_url"].replace("http://testserver", ""))
+    downloaded = client.get(body["download_url"].replace("http://testserver", ""))
 
     assert downloaded.status_code == 200
     # A .pptx is a zip; 'PK' is the signature that proves we got a real file back.
@@ -103,19 +121,19 @@ def test_generated_file_can_actually_be_downloaded(open_client: TestClient) -> N
     assert len(downloaded.content) == body["size_bytes"]
 
 
-def test_invalid_spec_is_a_422_the_model_can_act_on(open_client: TestClient) -> None:
-    response = open_client.post(
+def test_invalid_spec_is_a_422_the_model_can_act_on(client: TestClient) -> None:
+    response = client.post(
         "/tools/create_presentation",
         json={"spec": {"title": "T", "slides": [{"layout": "does_not_exist"}]}},
-        headers=IDENTITY,
+        headers=SESSION,
     )
     assert response.status_code == 422
 
 
-def test_unknown_fields_are_rejected_rather_than_ignored(open_client: TestClient) -> None:
+def test_unknown_fields_are_rejected_rather_than_ignored(client: TestClient) -> None:
     """extra='forbid' turns a hallucinated field into a correctable error instead of a
     silently wrong document."""
-    response = open_client.post(
+    response = client.post(
         "/tools/create_presentation",
         json={
             "spec": {
@@ -123,20 +141,20 @@ def test_unknown_fields_are_rejected_rather_than_ignored(open_client: TestClient
                 "slides": [{"layout": "title", "title": "X", "image_url": "http://x"}],
             }
         },
-        headers=IDENTITY,
+        headers=SESSION,
     )
     assert response.status_code == 422
     assert "image_url" in response.text
 
 
-def test_missing_spec_returns_an_actionable_message(open_client: TestClient) -> None:
-    response = open_client.post("/tools/create_spreadsheet", json={}, headers=IDENTITY)
+def test_missing_spec_returns_an_actionable_message(client: TestClient) -> None:
+    response = client.post("/tools/create_spreadsheet", json={}, headers=SESSION)
     assert response.status_code == 422
     assert "SheetSpec" in response.text
 
 
-def test_spreadsheet_and_document_routes_work(open_client: TestClient) -> None:
-    sheet = open_client.post(
+def test_spreadsheet_and_document_routes_work(client: TestClient) -> None:
+    sheet = client.post(
         "/tools/create_spreadsheet",
         json={
             "spec": {
@@ -150,12 +168,12 @@ def test_spreadsheet_and_document_routes_work(open_client: TestClient) -> None:
                 ],
             }
         },
-        headers=IDENTITY,
+        headers=SESSION,
     )
     assert sheet.status_code == 200, sheet.text
     assert sheet.json()["sheet_names"] == ["S1"]
 
-    doc = open_client.post(
+    doc = client.post(
         "/tools/create_document",
         json={
             "spec": {
@@ -163,7 +181,7 @@ def test_spreadsheet_and_document_routes_work(open_client: TestClient) -> None:
                 "blocks": [{"type": "heading", "text": "Kapitel", "level": 1}],
             }
         },
-        headers=IDENTITY,
+        headers=SESSION,
     )
     assert doc.status_code == 200, doc.text
     assert doc.json()["page_estimate"] >= 1
@@ -201,13 +219,13 @@ async def test_mcp_tool_schemas_are_specific_enough_to_be_useful(settings: Setti
     assert "two_content" in str(schema), "slide layout enum should be inlined"
 
 
-def test_mcp_mount_answers_an_initialize_request(open_client: TestClient) -> None:
+def test_mcp_mount_answers_an_initialize_request(client: TestClient) -> None:
     """The regression test for python-sdk #1367.
 
     If the session manager is not entered in the app lifespan, this mount returns 404 or
     500 with nothing explaining why.
     """
-    response = open_client.post(
+    response = client.post(
         "/mcp/",
         headers={
             "Content-Type": "application/json",
@@ -230,31 +248,26 @@ def test_mcp_mount_answers_an_initialize_request(open_client: TestClient) -> Non
     assert "HiveMCP" in response.text
 
 
-def test_mcp_mount_enforces_the_bearer_token(client: TestClient) -> None:
-    """FastAPI dependencies do not reach a mounted sub-app, so this needs its own check."""
+def test_mcp_tool_call_without_a_session_is_refused(client: TestClient) -> None:
+    """Authentication sits in the tool, not in middleware at the mount.
+
+    The session token is not only a gate but the credential the tool acts with, so it
+    has to reach the handler rather than be checked and discarded at the edge. The
+    handshake itself therefore stays open; the tool call is what requires a session.
+    """
     response = client.post(
         "/mcp/",
-        headers={"Accept": "application/json, text/event-stream"},
-        json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
-    )
-    assert response.status_code == 401
-
-    authorised = client.post(
-        "/mcp/",
         headers={
-            **AUTH,
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
         },
         json={
             "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-06-18",
-                "capabilities": {},
-                "clientInfo": {"name": "pytest", "version": "0"},
-            },
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "hive_create_presentation", "arguments": MINIMAL_DECK},
         },
     )
-    assert authorised.status_code == 200, authorised.text
+
+    assert "session" in response.text.lower(), response.text[:400]
+    assert "Test.pptx" not in response.text, "must not have rendered anything"

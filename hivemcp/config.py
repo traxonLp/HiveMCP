@@ -16,13 +16,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Settings where an empty value must mean "not configured" rather than "configured as
 # an empty string". A .env written from the template carries lines like
-# ``HIVE_AUTH_TOKEN=``, and without this normalisation that reads as an empty string:
-# not None, therefore truthy to an `is not None` check, therefore auth switches on with
-# an empty token and rejects every request with 401.
+# ``HIVE_LLM_FALLBACK_MODEL=``, and without this normalisation that reads as an empty
+# string rather than None. That once switched auth on with an empty token and rejected
+# every request with a 401 that looked like a networking fault.
 _OPTIONAL_SECRETS = (
-    "auth_token",
     "owui_url",
-    "owui_api_key",
     "llm_fallback_model",
 )
 
@@ -33,6 +31,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        populate_by_name=True,
     )
 
     @field_validator(*_OPTIONAL_SECRETS, mode="before")
@@ -61,11 +60,17 @@ class Settings(BaseSettings):
     environment: Literal["dev", "prod"] = "dev"
 
     # --- Auth ------------------------------------------------------------------
-    auth_token: str | None = Field(
-        default=None,
-        description="Shared bearer token between OpenWebUI and HiveMCP. "
-        "When unset in dev, auth is disabled; in prod a missing token is a hard error.",
+    # There is no shared secret and no service account. Callers authenticate with their
+    # own OpenWebUI session token, which HiveMCP validates against HIVE_OWUI_URL. That
+    # makes the identity a proof rather than a claim, and lets HiveMCP act as the user
+    # against the Files API so generated documents belong to the right person.
+    session_cache_ttl_seconds: float = Field(
+        default=60.0,
+        description="How long a validated session is trusted without re-checking. "
+        "Zero validates on every call, which is correct but adds a round-trip before "
+        "any work starts.",
     )
+    session_cache_max_entries: int = 2000
     signing_key: str = Field(
         default_factory=lambda: secrets.token_urlsafe(32),
         description="HMAC key for signed /ui URLs. MUST be set explicitly when running "
@@ -76,6 +81,15 @@ class Settings(BaseSettings):
 
     # --- Storage ---------------------------------------------------------------
     data_dir: Path = Field(default=Path("/data"))
+    templates_dir_override: Path | None = Field(
+        default=None,
+        alias="HIVE_TEMPLATES_DIR",
+        description="Where the shared template pool lives. Defaults to a subdirectory of "
+        "HIVE_DATA_DIR. Worth pointing at its own small volume: templates are written "
+        "rarely by administrators and read constantly by everyone, while artifacts churn "
+        "and are swept on a TTL — different sizes, different access patterns, and a "
+        "template pool that survives clearing the artifact volume.",
+    )
     tmp_ttl_minutes: int = 60
     max_upload_mb: int = 50
     max_render_concurrency: int = Field(
@@ -92,8 +106,13 @@ class Settings(BaseSettings):
     )
 
     # --- OpenWebUI -------------------------------------------------------------
-    owui_url: str | None = None
-    owui_api_key: str | None = None
+    # Required, not optional: this is what session tokens are validated against, so
+    # without it nothing can authenticate at all.
+    owui_url: str | None = Field(
+        default=None,
+        description="Base URL of the OpenWebUI instance, as reachable from this "
+        "container. Session tokens are validated here and files are uploaded here.",
+    )
     owui_timeout_seconds: float = 30.0
 
     # --- Optional LLM expansion (hybrid mode) ----------------------------------
@@ -120,7 +139,7 @@ class Settings(BaseSettings):
     # --- Derived ---------------------------------------------------------------
     @property
     def templates_dir(self) -> Path:
-        return self.data_dir / "templates"
+        return self.templates_dir_override or (self.data_dir / "templates")
 
     @property
     def tmp_dir(self) -> Path:
@@ -135,28 +154,15 @@ class Settings(BaseSettings):
         return self.max_upload_mb * 1024 * 1024
 
     @property
-    def auth_enabled(self) -> bool:
-        # Truthiness, not `is not None`: belt and braces with the validator above, since
-        # getting this wrong locks every caller out with a 401 that looks like a
-        # networking problem.
-        return bool(self.auth_token)
-
-    @property
     def owui_configured(self) -> bool:
-        return bool(self.owui_url and self.owui_api_key)
+        return bool(self.owui_url)
 
     @model_validator(mode="after")
     def _check_prod_invariants(self) -> Settings:
         if self.environment != "prod":
             return self
         missing = [
-            name
-            for name, value in (
-                ("HIVE_AUTH_TOKEN", self.auth_token),
-                ("HIVE_OWUI_URL", self.owui_url),
-                ("HIVE_OWUI_API_KEY", self.owui_api_key),
-            )
-            if not value
+            name for name, value in (("HIVE_OWUI_URL", self.owui_url),) if not value
         ]
         if missing:
             raise ValueError(
@@ -165,8 +171,8 @@ class Settings(BaseSettings):
             )
         if self.llm_enabled and not self.owui_configured:
             raise ValueError(
-                "HIVE_LLM_ENABLED=true requires HIVE_OWUI_URL and HIVE_OWUI_API_KEY: "
-                "brief expansion runs through OpenWebUI's own chat-completions API."
+                "HIVE_LLM_ENABLED=true requires HIVE_OWUI_URL: brief expansion runs "
+                "through OpenWebUI's own chat-completions API."
             )
         return self
 

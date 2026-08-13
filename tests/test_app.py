@@ -6,7 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from hivemcp.app import create_app
-from hivemcp.auth import Identity, sign_ui_token
+from hivemcp.auth import Caller, Identity, sign_ui_token
 from hivemcp.config import Settings
 from hivemcp.core.delivery import CompositeDelivery, DeliveryResult, SignedUrlDelivery
 from hivemcp.core.files.workdir import ArtifactStore
@@ -98,7 +98,7 @@ async def test_signed_url_delivery_builds_an_absolute_url(settings: Settings) ->
     delivery = SignedUrlDelivery(settings, ArtifactStore(settings.tmp_dir))
     rendered = RenderedFile(data=b"x", filename="a.pptx", media_type="application/octet-stream")
 
-    result = await delivery.deliver(rendered, Identity(user_id="u-1"))
+    result = await delivery.deliver(rendered, Caller(identity=Identity(user_id="u-1"), token="session-token"))
 
     assert result.download_url is not None
     assert result.download_url.startswith("http://testserver/d/")
@@ -109,7 +109,7 @@ async def test_composite_delivery_falls_back_and_says_so(settings: Settings) -> 
     settings.ensure_dirs()
 
     class Failing:
-        async def deliver(self, rendered, identity):  # noqa: ANN001, ANN202
+        async def deliver(self, rendered, caller):  # noqa: ANN001, ANN202
             raise RuntimeError("OpenWebUI returned 403")
 
     delivery = CompositeDelivery(
@@ -117,7 +117,7 @@ async def test_composite_delivery_falls_back_and_says_so(settings: Settings) -> 
     )
     rendered = RenderedFile(data=b"x", filename="a.pptx", media_type="application/octet-stream")
 
-    result = await delivery.deliver(rendered, Identity(user_id="u-1"))
+    result = await delivery.deliver(rendered, Caller(identity=Identity(user_id="u-1"), token="session-token"))
 
     assert result.download_url is not None
     assert any("download link" in warning for warning in result.warnings)
@@ -129,7 +129,7 @@ async def test_composite_delivery_adds_a_link_even_when_upload_succeeds(
     settings.ensure_dirs()
 
     class Succeeding:
-        async def deliver(self, rendered, identity):  # noqa: ANN001, ANN202
+        async def deliver(self, rendered, caller):  # noqa: ANN001, ANN202
             return DeliveryResult(file_id="owui-123")
 
     delivery = CompositeDelivery(
@@ -137,7 +137,7 @@ async def test_composite_delivery_adds_a_link_even_when_upload_succeeds(
     )
     rendered = RenderedFile(data=b"x", filename="a.pptx", media_type="application/octet-stream")
 
-    result = await delivery.deliver(rendered, Identity(user_id="u-1"))
+    result = await delivery.deliver(rendered, Caller(identity=Identity(user_id="u-1"), token="session-token"))
 
     assert result.file_id == "owui-123"
     assert result.download_url is not None

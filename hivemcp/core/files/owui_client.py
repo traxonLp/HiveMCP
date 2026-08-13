@@ -1,11 +1,10 @@
 """Client for the OpenWebUI Files API.
 
-Used for both directions: pulling files the user attached to the chat, and pushing
-finished documents back so they appear in their file list.
-
-Authentication is a service API key. OpenWebUI attributes uploads to the owner of that
-key, which is the open question behind plan risk R1 — hence ``CompositeDelivery``, which
-always mints a download link alongside the upload.
+Every call carries the *caller's* session token rather than a service credential, so
+OpenWebUI attributes uploads to the person who asked for the document. HiveMCP holds no
+credentials of its own here: the shared ``httpx.AsyncClient`` exists for connection
+pooling and deliberately has no default ``Authorization`` header, so forgetting to pass
+a token fails loudly instead of silently acting as somebody else.
 """
 
 from __future__ import annotations
@@ -24,8 +23,8 @@ class OwuiError(Exception):
 class OwuiNotConfigured(OwuiError):
     def __init__(self) -> None:
         super().__init__(
-            "OpenWebUI is not configured. Set HIVE_OWUI_URL and HIVE_OWUI_API_KEY to "
-            "read files from the chat or upload results back into it."
+            "OpenWebUI is not configured. Set HIVE_OWUI_URL so HiveMCP can read files "
+            "from the chat and upload results back into it."
         )
 
 
@@ -33,31 +32,25 @@ class OwuiFilesClient:
     def __init__(
         self,
         base_url: str | None,
-        api_key: str | None,
         *,
         timeout: float = 30.0,
         max_bytes: int = 50 * 1024 * 1024,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self.base_url = (base_url or "").rstrip("/")
-        self.api_key = api_key
         self.timeout = timeout
         self.max_bytes = max_bytes
         self._client = client
 
     @property
     def configured(self) -> bool:
-        return bool(self.base_url and self.api_key)
+        return bool(self.base_url)
 
     def _require(self) -> httpx.AsyncClient:
         if not self.configured:
             raise OwuiNotConfigured
         if self._client is None:
-            self._client = httpx.AsyncClient(
-                base_url=self.base_url,
-                timeout=self.timeout,
-                headers={"Authorization": f"Bearer {self.api_key}"},
-            )
+            self._client = httpx.AsyncClient(base_url=self.base_url, timeout=self.timeout)
         return self._client
 
     async def aclose(self) -> None:
@@ -65,25 +58,35 @@ class OwuiFilesClient:
             await self._client.aclose()
             self._client = None
 
+    @staticmethod
+    def _auth(token: str) -> dict[str, str]:
+        if not token:
+            raise OwuiError("no session token available for this request")
+        return {"Authorization": f"Bearer {token}"}
+
     # ------------------------------------------------------------------ read
 
-    async def get_content(self, file_id: str) -> bytes:
+    async def get_content(self, file_id: str, token: str) -> bytes:
         """Download a file the user attached to the chat.
 
-        The raw bytes are fetched rather than OpenWebUI's extracted text: editing and
-        template inspection need the OOXML structure, which extraction throws away.
+        Raw bytes rather than OpenWebUI's extracted text: editing and template
+        inspection need the OOXML structure, which extraction throws away.
         """
         client = self._require()
         try:
-            response = await client.get(f"/api/v1/files/{file_id}/content")
+            response = await client.get(
+                f"/api/v1/files/{file_id}/content", headers=self._auth(token)
+            )
         except httpx.HTTPError as exc:
             raise OwuiError(f"could not reach OpenWebUI: {exc}") from exc
 
-        if response.status_code == 404:
+        if response.status_code in (401, 403):
             raise OwuiError(
-                f"file {file_id!r} does not exist in OpenWebUI, or the service account "
-                "cannot see it"
+                "OpenWebUI refused access to this file. The session may have expired, "
+                "or the file belongs to someone else."
             )
+        if response.status_code == 404:
+            raise OwuiError(f"file {file_id!r} does not exist in OpenWebUI")
         if response.status_code >= 400:
             raise OwuiError(
                 f"OpenWebUI returned {response.status_code} for file {file_id!r}: "
@@ -100,13 +103,12 @@ class OwuiFilesClient:
 
     # ----------------------------------------------------------------- write
 
-    async def upload(self, data: bytes, filename: str, media_type: str) -> str:
-        """Upload a generated document and return its OpenWebUI file id.
+    async def upload(self, data: bytes, filename: str, media_type: str, token: str) -> str:
+        """Upload a generated document as the calling user; return its file id.
 
         ``process=false`` matters: the default runs text extraction and embedding over
         the upload. For a document we just generated that is wasted work, and it opens
-        the documented race where the file is not ready immediately after the call
-        returns.
+        the documented race where the file is not ready when the call returns.
         """
         client = self._require()
         try:
@@ -114,11 +116,16 @@ class OwuiFilesClient:
                 "/api/v1/files/",
                 params={"process": "false"},
                 files={"file": (filename, data, media_type)},
-                headers={"Accept": "application/json"},
+                headers={**self._auth(token), "Accept": "application/json"},
             )
         except httpx.HTTPError as exc:
             raise OwuiError(f"could not reach OpenWebUI: {exc}") from exc
 
+        if response.status_code in (401, 403):
+            raise OwuiError(
+                "OpenWebUI refused the upload. The chat session may have expired; "
+                "asking again should get a fresh one."
+            )
         if response.status_code >= 400:
             raise OwuiError(
                 f"OpenWebUI rejected the upload with {response.status_code}: "

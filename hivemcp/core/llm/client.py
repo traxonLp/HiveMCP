@@ -32,35 +32,37 @@ class OwuiChatClient:
     def __init__(
         self,
         base_url: str | None,
-        api_key: str | None,
         *,
         timeout: float = 120.0,
         max_output_tokens: int = 8000,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self.base_url = (base_url or "").rstrip("/")
-        self.api_key = api_key
         self.timeout = timeout
         self.max_output_tokens = max_output_tokens
         self._client = client
 
     @property
     def configured(self) -> bool:
-        return bool(self.base_url and self.api_key)
+        return bool(self.base_url)
 
     def _require(self) -> httpx.AsyncClient:
         if not self.configured:
             raise LlmError(
                 "OpenWebUI is not configured, so the selected model cannot be called. "
-                "Set HIVE_OWUI_URL and HIVE_OWUI_API_KEY."
+                "Set HIVE_OWUI_URL."
             )
         if self._client is None:
-            self._client = httpx.AsyncClient(
-                base_url=self.base_url,
-                timeout=self.timeout,
-                headers={"Authorization": f"Bearer {self.api_key}"},
-            )
+            # No default Authorization header: each call carries the caller's own
+            # session token, so the model runs under their permissions and their quota.
+            self._client = httpx.AsyncClient(base_url=self.base_url, timeout=self.timeout)
         return self._client
+
+    @staticmethod
+    def _auth(token: str) -> dict[str, str]:
+        if not token:
+            raise LlmError("no session token available for this request")
+        return {"Authorization": f"Bearer {token}"}
 
     async def aclose(self) -> None:
         if self._client is not None:
@@ -69,27 +71,25 @@ class OwuiChatClient:
 
     # ------------------------------------------------------------------ model
 
-    async def get_chat_model(self, chat_id: str) -> str | None:
+    async def get_chat_model(self, chat_id: str, token: str) -> str | None:
         """Read the model a chat is using.
 
-        Returns None rather than raising: an unresolvable model is a reason to fall back,
-        not to fail the whole tool call. Notably the service API key acts as *its owner*,
-        so reading another user's chat is expected to 404 in a multi-user install.
+        With the caller's own session token this reads *their* chat, so it works for
+        every user rather than only for the one who owned a service key. Still returns
+        None instead of raising: an unresolvable model is a reason to fall back, not to
+        fail the tool call.
         """
         client = self._require()
         try:
-            response = await client.get(f"/api/v1/chats/{chat_id}")
+            response = await client.get(
+                f"/api/v1/chats/{chat_id}", headers=self._auth(token)
+            )
         except httpx.HTTPError as exc:
             logger.debug("chat lookup failed for %s: %s", chat_id, exc)
             return None
 
         if response.status_code != 200:
-            logger.debug(
-                "chat lookup for %s returned %s (the service account may not be able "
-                "to read this chat)",
-                chat_id,
-                response.status_code,
-            )
+            logger.debug("chat lookup for %s returned %s", chat_id, response.status_code)
             return None
 
         try:
@@ -104,6 +104,7 @@ class OwuiChatClient:
         self,
         model: str,
         messages: list[dict[str, str]],
+        token: str,
         *,
         temperature: float = 0.4,
     ) -> str:
@@ -121,15 +122,17 @@ class OwuiChatClient:
         }
         try:
             response = await client.post(
-                "/api/chat/completions", json=body, headers={LOOP_GUARD_HEADER: "1"}
+                "/api/chat/completions",
+                json=body,
+                headers={**self._auth(token), LOOP_GUARD_HEADER: "1"},
             )
         except httpx.HTTPError as exc:
             raise LlmError(f"could not reach OpenWebUI: {exc}") from exc
 
-        if response.status_code == 401:
+        if response.status_code in (401, 403):
             raise LlmError(
-                "OpenWebUI rejected the API key. Check HIVE_OWUI_API_KEY, and that its "
-                "owner is allowed to use this model."
+                f"OpenWebUI refused the completion. The chat session may have expired, "
+                f"or you may not have access to {model!r}."
             )
         if response.status_code >= 400:
             raise LlmError(

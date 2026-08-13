@@ -12,7 +12,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from ..auth import Identity, RateLimiter
+from ..auth import Caller, RateLimiter
 from ..config import Settings
 from .delivery import Delivery
 from .files.owui_client import OwuiError, OwuiFilesClient
@@ -24,6 +24,8 @@ from .render.base import RenderedFile, RenderError
 from .render.docx import render_document
 from .render.pptx import render_presentation
 from .render.xlsx import render_spreadsheet
+from .templates.service import TemplateService
+from .templates.store import TemplateError
 
 logger = logging.getLogger(__name__)
 
@@ -44,12 +46,14 @@ class DocumentService:
         delivery: Delivery,
         owui: OwuiFilesClient,
         chat: OwuiChatClient | None = None,
+        templates: TemplateService | None = None,
         limiter: RateLimiter | None = None,
     ) -> None:
         self.settings = settings
         self.delivery = delivery
         self.owui = owui
-        self.chat = chat or OwuiChatClient(settings.owui_url, settings.owui_api_key)
+        self.chat = chat or OwuiChatClient(settings.owui_url)
+        self.templates = templates
         self.limiter = limiter or RateLimiter()
         # Rendering is CPU- and memory-heavy and runs in a worker thread. Without a
         # bound, a handful of concurrent large workbooks is the most likely way to get
@@ -60,7 +64,7 @@ class DocumentService:
 
     async def create_presentation(
         self,
-        identity: Identity,
+        caller: Caller,
         options: RenderOptions | None = None,
         spec: DeckSpec | None = None,
         brief: str | None = None,
@@ -68,19 +72,19 @@ class DocumentService:
         options = options or RenderOptions()
         notes: list[str] = []
         spec = await self._resolve_spec(
-            spec, brief, options, DeckSpec, identity, "presentation", notes
+            spec, brief, options, DeckSpec, caller, "presentation", notes
         )
-        template = self._template_path(options)
-        resolver = self._image_resolver(identity)
+        template = self._template_path(options, caller)
+        resolver = self._image_resolver(caller)
 
         rendered = await self._render(
             render_presentation, spec, options, image_resolver=resolver, template_path=template
         )
-        return await self._deliver(rendered, identity, notes)
+        return await self._deliver(rendered, caller, notes)
 
     async def create_document(
         self,
-        identity: Identity,
+        caller: Caller,
         options: RenderOptions | None = None,
         spec: DocSpec | None = None,
         brief: str | None = None,
@@ -88,19 +92,19 @@ class DocumentService:
         options = options or RenderOptions()
         notes: list[str] = []
         spec = await self._resolve_spec(
-            spec, brief, options, DocSpec, identity, "document", notes
+            spec, brief, options, DocSpec, caller, "document", notes
         )
-        template = self._template_path(options)
-        resolver = self._image_resolver(identity)
+        template = self._template_path(options, caller)
+        resolver = self._image_resolver(caller)
 
         rendered = await self._render(
             render_document, spec, options, image_resolver=resolver, template_path=template
         )
-        return await self._deliver(rendered, identity, notes)
+        return await self._deliver(rendered, caller, notes)
 
     async def create_spreadsheet(
         self,
-        identity: Identity,
+        caller: Caller,
         options: RenderOptions | None = None,
         spec: SheetSpec | None = None,
         brief: str | None = None,
@@ -108,14 +112,14 @@ class DocumentService:
         options = options or RenderOptions()
         notes: list[str] = []
         spec = await self._resolve_spec(
-            spec, brief, options, SheetSpec, identity, "workbook", notes
+            spec, brief, options, SheetSpec, caller, "workbook", notes
         )
-        template = self._template_path(options)
+        template = self._template_path(options, caller)
 
         rendered = await self._render(
             render_spreadsheet, spec, options, template_path=template
         )
-        return await self._deliver(rendered, identity, notes)
+        return await self._deliver(rendered, caller, notes)
 
     # --------------------------------------------------------------- helpers
 
@@ -125,11 +129,11 @@ class DocumentService:
         brief: str | None,
         options: RenderOptions,
         model: type,
-        identity: Identity,
+        caller: Caller,
         kind: str,
         warnings: list[str],
     ) -> Any:
-        if not self.limiter.allow(identity.user_id):
+        if not self.limiter.allow(caller.identity.user_id):
             raise ToolError(
                 "Too many document requests in a short time. Wait a moment and try again."
             )
@@ -152,7 +156,7 @@ class DocumentService:
         # Expansion runs on the model the user selected in the chat, reached through
         # OpenWebUI's own chat-completions API.
         try:
-            resolved = await resolve_model(self.chat, self.settings, identity)
+            resolved = await resolve_model(self.chat, self.settings, caller)
         except ModelUnavailable as exc:
             raise ToolError(str(exc)) from exc
 
@@ -164,7 +168,7 @@ class DocumentService:
             return await expand_brief(
                 self.chat,
                 self.settings,
-                identity,
+                caller,
                 resolved.model,
                 brief,
                 options,
@@ -174,15 +178,22 @@ class DocumentService:
         except ExpansionError as exc:
             raise ToolError(str(exc)) from exc
 
-    def _template_path(self, options: RenderOptions) -> Path | None:
+    def _template_path(self, options: RenderOptions, caller: Caller) -> Path | None:
         if options.template_id is None:
             return None
-        raise ToolError(
-            f"Template {options.template_id!r} cannot be used yet: template support is "
-            "milestone M4. Omit 'template_id' to render with the default theme."
-        )
+        if self.templates is None:
+            raise ToolError(
+                "Templates are not available on this server. Omit 'template_id' to "
+                "render with the default theme."
+            )
+        try:
+            return self.templates.path_for(caller, options.template_id)
+        except TemplateError as exc:
+            # The store's messages already say what to do next (usually: call
+            # hive_list_templates), so they are passed through rather than rewrapped.
+            raise ToolError(str(exc)) from exc
 
-    def _image_resolver(self, identity: Identity):  # noqa: ANN202 - closure type is noise
+    def _image_resolver(self, caller: Caller):  # noqa: ANN202 - closure type is noise
         """Bridge the synchronous renderers to the async Files API.
 
         The renderers are deliberately synchronous so they can run in a worker thread.
@@ -192,7 +203,9 @@ class DocumentService:
         loop = asyncio.get_running_loop()
 
         def resolve(file_id: str) -> bytes:
-            future = asyncio.run_coroutine_threadsafe(self.owui.get_content(file_id), loop)
+            future = asyncio.run_coroutine_threadsafe(
+                self.owui.get_content(file_id, caller.token), loop
+            )
             try:
                 return future.result(timeout=self.settings.owui_timeout_seconds + 5)
             except OwuiError as exc:
@@ -211,9 +224,9 @@ class DocumentService:
                 raise RenderError(f"the document could not be built: {exc}") from exc
 
     async def _deliver(
-        self, rendered: RenderedFile, identity: Identity, notes: list[str] | None = None
+        self, rendered: RenderedFile, caller: Caller, notes: list[str] | None = None
     ) -> RenderResult:
-        result = await self.delivery.deliver(rendered, identity)
+        result = await self.delivery.deliver(rendered, caller)
         return RenderResult(
             file_id=result.file_id,
             download_url=result.download_url,

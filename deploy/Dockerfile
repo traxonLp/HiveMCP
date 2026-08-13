@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 #
 # Build from the repository root:
-#   docker build -f deploy/Dockerfile -t hivemcp:0.1.0 .
+#   docker build -f deploy/Dockerfile -t hivemcp:1.0.0 .
 
 # --------------------------------------------------------------------------- #
 # Builder

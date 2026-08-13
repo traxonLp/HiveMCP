@@ -11,7 +11,7 @@ import json
 import httpx
 import pytest
 
-from hivemcp.auth import Identity
+from hivemcp.auth import Caller, Identity
 from hivemcp.config import Settings
 from hivemcp.core.llm.client import LOOP_GUARD_HEADER, LlmError, OwuiChatClient
 from hivemcp.core.llm.expand import ExpansionError, expand_brief, extract_json
@@ -24,14 +24,21 @@ VALID_DECK = {
 }
 
 
+TOKEN = "user-session-token"
+
+
+def a_caller(**identity_kwargs) -> Caller:  # noqa: ANN003
+    identity_kwargs.setdefault("user_id", "u-1")
+    return Caller(identity=Identity(**identity_kwargs), token=TOKEN)
+
+
 def chat_client(handler, **kwargs) -> OwuiChatClient:  # noqa: ANN001
+    # No default Authorization header: the caller's own token goes on every call, so
+    # completions run under their permissions rather than a service account's.
     return OwuiChatClient(
         "http://owui:8080",
-        "sk-test",
         client=httpx.AsyncClient(
-            base_url="http://owui:8080",
-            transport=httpx.MockTransport(handler),
-            headers={"Authorization": "Bearer sk-test"},
+            base_url="http://owui:8080", transport=httpx.MockTransport(handler)
         ),
         **kwargs,
     )
@@ -43,13 +50,7 @@ def completion(text: str) -> httpx.Response:
 
 @pytest.fixture
 def llm_settings(settings: Settings) -> Settings:
-    return settings.model_copy(
-        update={
-            "llm_enabled": True,
-            "owui_url": "http://owui:8080",
-            "owui_api_key": "sk-test",
-        }
-    )
+    return settings.model_copy(update={"llm_enabled": True})
 
 
 # --------------------------------------------------------------------------- #
@@ -62,7 +63,7 @@ async def test_pinned_header_wins(llm_settings: Settings) -> None:
         raise AssertionError("no lookup should happen when a model is pinned")
 
     resolved = await resolve_model(
-        chat_client(handler), llm_settings, Identity(user_id="u", model="qwen3:32b")
+        chat_client(handler), llm_settings, a_caller(model="qwen3:32b")
     )
     assert resolved.model == "qwen3:32b"
     assert resolved.source == "header"
@@ -72,10 +73,13 @@ async def test_pinned_header_wins(llm_settings: Settings) -> None:
 async def test_chat_lookup_finds_the_users_selection(llm_settings: Settings) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/v1/chats/c-1"
+        # The caller's own token is what makes this readable: with a service key it
+        # would 404 for everyone except the key's owner.
+        assert request.headers["Authorization"] == f"Bearer {TOKEN}"
         return httpx.Response(200, json={"chat": {"models": ["llama4:70b"]}})
 
     resolved = await resolve_model(
-        chat_client(handler), llm_settings, Identity(user_id="u", chat_id="c-1")
+        chat_client(handler), llm_settings, a_caller(chat_id="c-1")
     )
     assert resolved.model == "llama4:70b"
     assert resolved.is_users_selection
@@ -99,13 +103,13 @@ async def test_chat_payload_shapes(llm_settings: Settings, payload: dict) -> Non
         return httpx.Response(200, json=payload)
 
     resolved = await resolve_model(
-        chat_client(handler), llm_settings, Identity(user_id="u", chat_id="c-1")
+        chat_client(handler), llm_settings, a_caller(chat_id="c-1")
     )
     assert resolved.model == "m-1"
 
 
 async def test_unreadable_chat_falls_back(llm_settings: Settings) -> None:
-    """A service key cannot read another user's chat; that must not be fatal."""
+    """A deleted or inaccessible chat must not be fatal."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(404)
@@ -113,7 +117,7 @@ async def test_unreadable_chat_falls_back(llm_settings: Settings) -> None:
     resolved = await resolve_model(
         chat_client(handler),
         llm_settings.model_copy(update={"llm_fallback_model": "gpt-4o-mini"}),
-        Identity(user_id="u", chat_id="c-1"),
+        a_caller(chat_id="c-1"),
     )
     assert resolved.model == "gpt-4o-mini"
     assert resolved.source == "fallback"
@@ -131,7 +135,7 @@ async def test_no_model_and_no_fallback_says_what_to_configure(
 
     with pytest.raises(ModelUnavailable, match="X-Hive-Chat-Id"):
         await resolve_model(
-            chat_client(handler), llm_settings, Identity(user_id="u", chat_id="c-1")
+            chat_client(handler), llm_settings, a_caller(chat_id="c-1")
         )
 
 
@@ -176,7 +180,7 @@ async def test_expansion_returns_a_validated_spec(llm_settings: Settings) -> Non
     spec = await expand_brief(
         chat_client(handler),
         llm_settings,
-        Identity(user_id="u"),
+        a_caller(),
         "llama4:70b",
         "Preisuebersicht fuer 2026",
         RenderOptions(audience="Vorstand", target_length=6),
@@ -212,7 +216,7 @@ async def test_invalid_output_is_repaired_on_the_second_attempt(
     spec = await expand_brief(
         chat_client(handler),
         llm_settings,
-        Identity(user_id="u"),
+        a_caller(),
         "m",
         "brief",
         RenderOptions(),
@@ -235,7 +239,7 @@ async def test_giving_up_points_back_at_the_spec_parameter(llm_settings: Setting
         await expand_brief(
             chat_client(handler),
             llm_settings,
-            Identity(user_id="u"),
+            a_caller(),
             "m",
             "brief",
             RenderOptions(),
@@ -256,7 +260,7 @@ async def test_repair_attempts_are_bounded(llm_settings: Settings) -> None:
         await expand_brief(
             chat_client(handler),
             llm_settings.model_copy(update={"llm_max_repair_attempts": 2}),
-            Identity(user_id="u"),
+            a_caller(),
             "m",
             "brief",
             RenderOptions(),
@@ -271,7 +275,7 @@ async def test_rejected_api_key_names_the_likely_cause(llm_settings: Settings) -
         return httpx.Response(401, text="unauthorized")
 
     with pytest.raises(LlmError, match="allowed to use this model"):
-        await chat_client(handler).complete("m", [{"role": "user", "content": "hi"}])
+        await chat_client(handler).complete("m", [{"role": "user", "content": "hi"}], TOKEN)
 
 
 async def test_empty_completion_is_an_error(llm_settings: Settings) -> None:
@@ -279,7 +283,7 @@ async def test_empty_completion_is_an_error(llm_settings: Settings) -> None:
         return completion("   ")
 
     with pytest.raises(LlmError, match="empty response"):
-        await chat_client(handler).complete("m", [{"role": "user", "content": "hi"}])
+        await chat_client(handler).complete("m", [{"role": "user", "content": "hi"}], TOKEN)
 
 
 async def test_content_returned_as_typed_parts_is_joined(llm_settings: Settings) -> None:
@@ -300,16 +304,10 @@ async def test_content_returned_as_typed_parts_is_joined(llm_settings: Settings)
             },
         )
 
-    text = await chat_client(handler).complete("m", [{"role": "user", "content": "hi"}])
+    text = await chat_client(handler).complete("m", [{"role": "user", "content": "hi"}], TOKEN)
     assert extract_json(text) == {"a": 1}
 
 
-def test_enabling_brief_mode_requires_openwebui(settings: Settings) -> None:
+def test_enabling_brief_mode_requires_openwebui() -> None:
     with pytest.raises(ValueError, match="HIVE_OWUI_URL"):
-        Settings(
-            environment="prod",
-            auth_token="t",
-            owui_url=None,
-            owui_api_key=None,
-            llm_enabled=True,
-        )
+        Settings(environment="prod", owui_url=None, llm_enabled=True, _env_file=None)

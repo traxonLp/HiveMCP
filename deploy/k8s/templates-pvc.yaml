@@ -1,0 +1,81 @@
+# Two volumes, on purpose.
+#
+# The template pool and the artifact scratch space have opposite lifecycles: templates
+# are written rarely by administrators and read on nearly every request, artifacts are
+# written constantly and swept on a TTL. Separating them means the template pool survives
+# clearing or resizing the artifact volume, backups can cover the small valuable one
+# without the large disposable one, and a runaway render cannot fill the disk that holds
+# the corporate designs.
+#
+#   kubectl apply -f deploy/k8s/templates-pvc.yaml
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hivemcp-templates
+  labels:
+    app.kubernetes.io/name: hivemcp
+    app.kubernetes.io/component: templates
+spec:
+  accessModes:
+    # ReadWriteMany because every replica reads it, and any replica may serve the
+    # administrator who uploads. With a single replica ReadWriteOnce is enough and works
+    # on far more storage classes.
+    - ReadWriteMany
+  resources:
+    requests:
+      # A corporate template is a few hundred kilobytes. This is sized for hundreds of
+      # them plus room to be wrong about that.
+      storage: 1Gi
+  # storageClassName: nfs-client   # must support RWX; set to match your cluster
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hivemcp-data
+  labels:
+    app.kubernetes.io/name: hivemcp
+    app.kubernetes.io/component: artifacts
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      # Rendered documents awaiting download, swept after HIVE_TMP_TTL_MINUTES.
+      storage: 10Gi
+  # storageClassName: nfs-client
+---
+# Excerpt showing how the deployment consumes both. Not a complete Deployment.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hivemcp-volume-example
+data:
+  deployment-excerpt.yaml: |
+    spec:
+      template:
+        spec:
+          securityContext:
+            # Matches the image's uid/gid so both volumes are writable without root.
+            runAsNonRoot: true
+            runAsUser: 10001
+            fsGroup: 10001
+          containers:
+            - name: hivemcp
+              env:
+                - name: HIVE_DATA_DIR
+                  value: /data
+                - name: HIVE_TEMPLATES_DIR
+                  value: /templates
+              volumeMounts:
+                - name: data
+                  mountPath: /data
+                - name: templates
+                  mountPath: /templates
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: hivemcp-data
+            - name: templates
+              persistentVolumeClaim:
+                claimName: hivemcp-templates

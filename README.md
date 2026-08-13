@@ -1,4 +1,12 @@
-# HiveMCP
+<h1 align="center">HiveMCP</h1>
+
+<p align="center">
+  <img src="HiveMCP_Icon.png" alt="HiveMCP" width="140">
+</p>
+
+<p align="center"><strong>1.0.0</strong></p>
+
+---
 
 Generates and edits PowerPoint, Word and Excel files for [OpenWebUI](https://openwebui.com).
 Runs as a container, exposed both as an **MCP Streamable HTTP** server and as an
@@ -10,18 +18,30 @@ the native MCP surface. MCP gives protocol compatibility, OpenAPI gives the conf
 GUI. See [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) for the full
 reasoning and the milestone plan.
 
+## What it does
+
+| Tool | Who can use it |
+|---|---|
+| `hive_create_presentation` · `hive_create_document` · `hive_create_spreadsheet` | everyone |
+| `hive_list_templates` · `hive_inspect_template` | everyone |
+| `hive_upload_template` · `hive_delete_template` | administrators |
+| `hive_open_config` — settings card rendered inline in the chat | everyone |
+
+Generated files are uploaded with the caller's own session token, so they appear in that
+person's OpenWebUI file list, and a signed download link is attached as well.
+
 ## Status
 
 | Milestone | Scope | State |
 |---|---|---|
-| M0 | Integration spikes (Files-API ownership, Rich-UI render, OWUI version) | offen |
-| M1 | Skeleton: config, auth, health, download, Dockerfile | **fertig** |
-| M2 | Render core: pptx / docx / xlsx from a spec | **fertig** |
-| M3 | MCP + OpenAPI surfaces, OpenWebUI file delivery | **fertig** |
-| M4 | Templates: upload, inspect, fill | offen |
-| M5 | Configuration GUI as an iframe | offen |
-| M6 | Editing files uploaded to the chat | offen |
-| M7 | Skill, K8s manifests, hardening | offen |
+| M0 | Integration spikes: session auth, file ownership, Rich UI | **done** |
+| M1 | Skeleton: config, auth, health, download, Dockerfile | **done** |
+| M2 | Render core: pptx / docx / xlsx from a spec | **done** |
+| M3 | MCP + OpenAPI surfaces, OpenWebUI file delivery | **done** |
+| M4 | Templates: admin-curated pool, upload, inspect | **done** |
+| M5 | Configuration GUI as an iframe | **done** |
+| M6 | Editing files uploaded to the chat | open |
+| M7 | Skill, K8s manifests, hardening | open |
 
 ## Quick start
 
@@ -68,49 +88,59 @@ is admin-only; regular users may only add OpenAPI servers.
 | | MCP | OpenAPI |
 |---|---|---|
 | Type | `MCP (Streamable HTTP)` | `OpenAPI` |
-| URL | `http://hivemcp:8080/mcp` | `http://hivemcp:8080` |
-| Auth | `None` in dev, otherwise `Bearer` | same |
+| URL | `http://hivemcp:8080/mcp/` | `http://hivemcp:8080` |
+| Auth | **`Session`** | **`Session`** |
 
 Use `http://host.docker.internal:8080` instead when OpenWebUI runs in a container and
-HiveMCP does not. Set **Auth** to `None` unless you configured `HIVE_AUTH_TOKEN`:
-choosing `Bearer` without filling in the key sends an empty `Authorization` header, which
-most servers reject outright.
+HiveMCP does not.
 
-Paste this into the connection's **Headers** field so tool calls carry the caller's
-identity. OpenWebUI expands the tokens server-side:
+**Auth must be `Session`.** HiveMCP has no shared secret and no service account: it
+authenticates each caller by validating their own OpenWebUI session token, then reuses
+that token against the Files API so generated documents belong to the person who asked
+for them. Any other setting means no caller can be identified and every tool call is
+refused.
+
+Paste this into the connection's **Headers** field. These are context, not credentials —
+the identity comes from the validated token:
 
 ```json
 {
-  "X-Hive-User-Id": "{{USER_ID}}",
-  "X-Hive-User-Email": "{{USER_EMAIL}}",
-  "X-Hive-Groups": "{{USER_GROUPS}}",
   "X-Hive-Chat-Id": "{{CHAT_ID}}"
 }
 ```
 
-Both can be registered at once. MCP gives protocol compatibility with other clients;
-OpenAPI is the surface that can return Rich UI embeds, which the configuration GUI needs
-in M5.
+`X-Hive-Chat-Id` becomes required as soon as `HIVE_LLM_ENABLED=true`: it is the only way
+HiveMCP can find out which model you selected, since OpenWebUI offers no `{{MODEL}}`
+token and `__model__` reaches native Python tools only.
+
+Both surfaces can be registered at once. MCP gives protocol compatibility with other
+clients; OpenAPI is the surface that can return Rich UI embeds, which the configuration
+GUI needs in M5.
 
 ## Layout
 
 ```
 hivemcp/
-  app.py                  FastAPI factory: health, download, both surfaces
-  config.py               HIVE_* settings; refuses to start unauthenticated in prod
-  auth.py                 bearer check, identity headers, HMAC-signed UI links
+  app.py                    FastAPI factory: health, download, both surfaces
+  config.py                 HIVE_* settings; refuses to start without OpenWebUI in prod
+  auth.py                   session-token validation, HMAC-signed download links
   surfaces/
-    mcp_server.py         MCP Streamable HTTP, stateless, mounted at /mcp
-    openapi_tools.py      /tools/* with explicit operation ids
+    mcp_server.py           MCP Streamable HTTP, stateless, mounted at /mcp
+    openapi_tools.py        /tools/* with explicit operation ids
+    config_ui.py            the settings card, rendered inline in the chat
+    debug.py                dev-only diagnostics under /_debug
   core/
-    service.py            shared logic: validation, render semaphore, delivery
-    models.py             DeckSpec / DocSpec / SheetSpec / RenderOptions
-    delivery.py           signed URL, OpenWebUI upload, composite with fallback
-    render/               pptx.py, docx.py, xlsx.py, theme.py
-    files/owui_client.py  OpenWebUI Files API
-    files/workdir.py      artifact store on the PVC, with TTL sweep
-deploy/                   Dockerfile, docker-compose.yml, smoke.sh
-docs/IMPLEMENTATION_PLAN.md
+    service.py              shared logic: validation, render semaphore, delivery
+    models.py               DeckSpec / DocSpec / SheetSpec / RenderOptions
+    delivery.py             OpenWebUI upload plus a signed link
+    preferences.py          interface theme and locale, and how to read them
+    render/                 pptx.py, docx.py, xlsx.py, theme.py
+    templates/              admin-curated pool, inspection, upload validation
+    llm/                    brief expansion through the user's selected model
+    files/owui_client.py    OpenWebUI Files API
+    files/workdir.py        artifact store, with TTL sweep
+deploy/                     Dockerfile, docker-compose.yml, smoke.sh, k8s/
+docs/                       IMPLEMENTATION_PLAN.md, M0_SPIKES.md, OPENWEBUI_SETUP.md
 tests/
 ```
 
@@ -140,12 +170,67 @@ printer driver, so no library can know the real count. The result field is calle
 **Errors name their location.** A failure on slide 7 says so, because the model needs to
 know where to fix the spec, not just what was wrong.
 
+**The settings card matches OpenWebUI's theme through CSS, not through an API.** Nothing
+tells it: postMessage carries no appearance message, `window.args` needs `allowSameOrigin`,
+and OpenWebUI keeps the theme in the browser's localStorage rather than server-side. It
+does not need to be told. `prefers-color-scheme` evaluated *inside an iframe* reports the
+colour scheme of the embedding element, cross-origin included — resolved deliberately by
+the CSS Working Group. The one thing that makes it work is declaring `color-scheme: light
+dark`: pinning a single scheme both stops the query tracking the embedder and, per CSS
+Color Adjust, replaces the transparent canvas with an opaque one, turning the card into a
+white rectangle inside a dark chat. A toggle remains for instances that declare no scheme.
+
+**Language comes from the model, not the server.** The interface locale is client-side too,
+so `hive_open_config` takes a `language` argument and the tool description asks the model
+to pass the language the conversation is in. English otherwise. Simplified and Traditional
+Chinese are kept apart by script (`zh-Hant`, `zh-TW/HK/MO` → `zh-TW`) rather than collapsed
+onto `zh`, because serving one to a reader of the other is a visible error.
+
+**The settings card travels inside the tool result.** OpenWebUI embeds HTML returned by a
+tool when the response carries `Content-Disposition: inline`, so no separate URL is
+fetched and no signed link is needed. The card is fully sandboxed in return: nothing
+inside can call back, so everything it needs is inlined at render time and the only way
+out is `postMessage`.
+
+**Templates are an admin-curated pool.** Administrators add and remove them; everyone
+else lists, inspects and uses them. There are no private or per-group templates: a
+template is a corporate design, and central curation is the point. That also removed a
+question the earlier per-group layout could not answer, since group membership is not part
+of the validated identity. The pool lives on its own volume (`HIVE_TEMPLATES_DIR`) because
+it has the opposite lifecycle to rendered artifacts — rarely written, constantly read, and
+worth keeping when the artifact volume is cleared.
+
+**Templates are inspected, not guessed at.** `hive_inspect_template` reports each layout
+along with which value of the spec's `layout` enum it corresponds to, so a model does not
+have to bridge the vocabulary gap itself. Uploaded templates are validated by reading
+them, and rejected as archives first: an Office file is a zip, and an uploaded one is
+untrusted input.
+
 ## Configuration
 
-See [`.env.example`](.env.example). Two settings matter more than they look:
+See [`.env.example`](.env.example). The container holds no third-party credentials:
+`HIVE_OWUI_URL` and `HIVE_SIGNING_KEY` are all it needs.
 
+- `HIVE_OWUI_URL` — required. Session tokens are validated here, so nothing can
+  authenticate without it. It is a *server-to-server* URL: what works in your browser
+  usually does not work from inside the container.
 - `HIVE_SIGNING_KEY` — **must** be set explicitly when running more than one replica.
   Each pod otherwise generates its own key at start-up, and download links break whenever
   a request lands on a different pod than the one that signed the link.
-- `HIVE_ENVIRONMENT=prod` — makes the service refuse to start without an auth token and
-  OpenWebUI credentials, rather than coming up silently unauthenticated.
+- `HIVE_TEMPLATES_DIR` — the shared template pool. Defaults to a subdirectory of
+  `HIVE_DATA_DIR`; give it its own volume so the curated templates survive clearing the
+  artifact volume. See [`deploy/k8s/templates-pvc.yaml`](deploy/k8s/templates-pvc.yaml).
+- `HIVE_ENVIRONMENT=dev` — mounts the diagnostic endpoints under `/_debug`. They reflect
+  request headers back to the caller, so set `prod` anywhere that is reachable by others.
+
+## Adding a template
+
+Attach the file in the chat as an administrator and say what it should be called:
+
+> Save this as a template called "Corporate Deck 2026"
+
+HiveMCP validates it by opening it, stores it in the shared pool, and returns the same
+report `hive_inspect_template` gives — layouts, styles and `{{placeholders}}` — so no
+second call is needed. Everyone can then use it by passing `template_id` in
+`RenderOptions`. Non-administrators get a 403 that says so rather than a validation error
+they would try to fix by retrying.
