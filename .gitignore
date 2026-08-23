@@ -16,8 +16,50 @@ htmlcov/
 
 # Local config and data
 .env
+# Every .env variant except the committed template. The negation has to come after the
+# pattern; the other order does nothing.
+.env.*
+!.env.example
 data/
 *.log
+
+# Internal planning. Not secret — checked, and there are no keys, addresses or personal
+# data in them — just not the public face of the project. They are working documents:
+# decision records with rejected alternatives, and raw measurements from spikes against
+# a live instance.
+#
+# These were tracked before, so .gitignore alone would not have removed them. They were
+# untracked with `git rm --cached` in the same commit that added these lines.
+docs/IMPLEMENTATION_PLAN.md
+docs/M0_SPIKES.md
+
+# docs/OPENWEBUI_SETUP.md stays public on purpose: anyone deploying this needs it, and
+# it contains nothing but placeholders.
+
+# Scratch space, if you want somewhere inside the repo that never ships.
+scratch/
+*.local
+*.local.*
+
+# Screenshots and recordings tend to carry more than intended — a visible URL, a chat
+# title, an account name in a browser tab.
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+*.mov
+
+# The negations are per-extension, not `!assets/**`. A directory-wide negation
+# re-includes *everything* under that path — it does not just undo the image rules above
+# it, it undoes __pycache__/ and *.pyc too. `!hivemcp/**` did exactly that and pulled
+# every compiled bytecode directory back into `git status`.
+!assets/**/*.png
+!assets/**/*.jpg
+!assets/**/*.jpeg
+!assets/**/*.gif
+!assets/**/*.svg
+!hivemcp/**/*.png
 
 # Editors / OS
 .DS_Store

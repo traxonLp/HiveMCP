@@ -29,6 +29,9 @@ dependencies = [
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
+    # Only to parse deploy/k8s in the tests. Not a runtime dependency: nothing the
+    # server does at request time reads YAML.
+    "pyyaml>=6.0",
     "ruff>=0.7",
     "mypy>=1.13",
 ]

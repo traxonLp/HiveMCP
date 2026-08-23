@@ -1,0 +1,61 @@
+# Network isolation.
+#
+# Only takes effect if your CNI enforces NetworkPolicy — Calico, Cilium, Antrea and
+# friends do; plain flannel does not. Applying it on a cluster that ignores it is
+# harmless but gives no protection, so check before relying on it.
+#
+# Adjust every namespace selector below to your cluster. They are the parts that cannot
+# be guessed correctly from here, and a wrong one fails closed: HiveMCP will be unable
+# to reach OpenWebUI, and every call will fail authentication.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hivemcp
+  labels:
+    app.kubernetes.io/name: hivemcp
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: hivemcp
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # From the ingress controller, for browsers opening download links and iframes.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8080
+    # From OpenWebUI, which is what actually calls the tools.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openwebui
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    # DNS. Easy to forget, and everything below silently fails without it.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Back to OpenWebUI: validating session tokens, the Files API, and completions in
+    # brief mode. This is the only outbound destination HiveMCP needs — it talks to no
+    # third-party service and fetches nothing from the internet.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openwebui
+      ports:
+        - protocol: TCP
+          port: 8080

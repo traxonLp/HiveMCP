@@ -10,9 +10,11 @@ __pycache__
 .mypy_cache
 .coverage
 htmlcov
-tests
+# tests and deploy/k8s are deliberately NOT excluded: the `test` stage in
+# deploy/Dockerfile copies both, because the manifests are checked for internal
+# consistency by the suite. Only that stage copies them, so the runtime image still
+# ships without either.
 docs
-deploy/k8s
 data
 .env
 .DS_Store

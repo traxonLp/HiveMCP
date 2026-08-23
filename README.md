@@ -1,7 +1,7 @@
 <h1 align="center">HiveMCP</h1>
 
 <p align="center">
-  <img src="HiveMCP_Icon.png" alt="HiveMCP" width="140">
+  <img src="assets/HiveMCP_Banner.png" alt="HiveMCP">
 </p>
 
 <p align="center"><strong>1.0.0</strong></p>
@@ -15,14 +15,15 @@ Runs as a container, exposed both as an **MCP Streamable HTTP** server and as an
 Why both: OpenWebUI renders inline iframes only for tool results carrying
 `Content-Disposition: inline`, and that path exists for OpenAPI tool servers but not for
 the native MCP surface. MCP gives protocol compatibility, OpenAPI gives the configuration
-GUI. See [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) for the full
-reasoning and the milestone plan.
+GUI.
 
 ## What it does
 
 | Tool | Who can use it |
 |---|---|
 | `hive_create_presentation` · `hive_create_document` · `hive_create_spreadsheet` | everyone |
+| `hive_read_document` · `hive_edit_document` — patch a file from the chat | everyone |
+| `hive_show_download` — download card with a real button | everyone |
 | `hive_list_templates` · `hive_inspect_template` | everyone |
 | `hive_upload_template` · `hive_delete_template` | administrators |
 | `hive_open_config` — settings card rendered inline in the chat | everyone |
@@ -40,7 +41,7 @@ person's OpenWebUI file list, and a signed download link is attached as well.
 | M3 | MCP + OpenAPI surfaces, OpenWebUI file delivery | **done** |
 | M4 | Templates: admin-curated pool, upload, inspect | **done** |
 | M5 | Configuration GUI as an iframe | **done** |
-| M6 | Editing files uploaded to the chat | open |
+| M6 | Editing files uploaded to the chat | **done** |
 | M7 | Skill, K8s manifests, hardening | open |
 
 ## Quick start
@@ -139,8 +140,8 @@ hivemcp/
     llm/                    brief expansion through the user's selected model
     files/owui_client.py    OpenWebUI Files API
     files/workdir.py        artifact store, with TTL sweep
-deploy/                     Dockerfile, docker-compose.yml, smoke.sh, k8s/
-docs/                       IMPLEMENTATION_PLAN.md, M0_SPIKES.md, OPENWEBUI_SETUP.md
+deploy/                     Dockerfile, docker-compose.yml, smoke.sh, k8s/, PORTAINER.md
+docs/                       OPENWEBUI_SETUP.md
 tests/
 ```
 
@@ -199,6 +200,28 @@ question the earlier per-group layout could not answer, since group membership i
 of the validated identity. The pool lives on its own volume (`HIVE_TEMPLATES_DIR`) because
 it has the opposite lifecycle to rendered artifacts — rarely written, constantly read, and
 worth keeping when the artifact volume is cleared.
+
+**A URL in a tool result is not a link.** OpenWebUI renders tool results as JSON and only
+the assistant's own message as markdown, so a `download_url` sitting in the result is
+plain text. Every result therefore also carries `download_markdown`, a finished link the
+model can paste, and `hive_show_download` turns it into a Rich UI card with a real button,
+the file's size and any warnings that would otherwise be buried in the JSON. The button
+opens in a new tab rather than using the `download` attribute: sandboxed iframes carry
+`allow-downloads`, but triggering a download from inside one is unreliable and on iOS
+impossible, so the server's `Content-Disposition: attachment` does the work instead.
+
+**Editing patches, it does not rebuild.** `hive_edit_document` opens the uploaded file and
+changes specific things in it. Parsing a document into a spec and re-rendering would be
+simpler and would discard every piece of formatting the spec cannot express, which is most
+of them. Two consequences worth knowing: operations are all-or-nothing, because a
+half-applied edit hands back a file that looks finished and is not; and an operation that
+matched nothing is reported rather than swallowed, because `replace_text` for a string
+that does not occur succeeds trivially and changes nothing. The original file is never
+modified — the edit comes back as a new upload.
+
+**Uploads are identified by their contents.** An OpenWebUI file id carries no extension and
+an uploaded filename is a claim, so the format is read from the zip's own directory
+(`ppt/presentation.xml`, `word/document.xml`, `xl/workbook.xml`).
 
 **Templates are inspected, not guessed at.** `hive_inspect_template` reports each layout
 along with which value of the spec's `layout` enum it corresponds to, so a model does not

@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 #
 # Build from the repository root:
-#   docker build -f deploy/Dockerfile -t hivemcp:1.0.0 .
+#   docker build -f deploy/Dockerfile -t hivemcp:dev .
 
 # --------------------------------------------------------------------------- #
 # Builder
@@ -39,6 +39,40 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python /opt/venv/bin/python --no-deps --force-reinstall .
 
 # --------------------------------------------------------------------------- #
+# Test
+# --------------------------------------------------------------------------- #
+# Not part of the runtime chain: `docker build --target test` runs the suite, a plain
+# build skips this stage entirely and costs nothing.
+#
+# The point of testing in the image rather than on the host is that this is the exact
+# interpreter and the exact dependency set that production runs. Two bugs so far were
+# import-level breakage that only appeared inside the container — the kind a host venv
+# with slightly different versions can hide. It also means the suite is runnable without
+# a local Python 3.11+ at all, which is the difference between tests that run and tests
+# that merely exist.
+FROM builder AS test
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --python /opt/venv/bin/python \
+        pytest'>=8.3' pytest-asyncio'>=0.24' pyyaml'>=6.0'
+
+COPY tests ./tests
+# The Kubernetes manifests are checked for internal consistency — that the Deployment
+# mounts the paths the ConfigMap names, that the ingress host matches HIVE_PUBLIC_URL,
+# that fsGroup matches the image's uid. Cheap to verify, and each of those mismatches
+# fails at deploy time in a way that reads like something else.
+COPY deploy/k8s ./deploy/k8s
+
+# pytest is the entrypoint rather than a RUN step. Running it during the build would
+# turn every red test into a *build* failure: the output arrives wrapped in BuildKit's
+# step prefixes, nothing is inspectable afterwards because no image was produced, and
+# there is no way to re-run a single test without invalidating the layer. As an
+# entrypoint the exit code still propagates to `make test`, and arguments pass straight
+# through — `make test ARGS="-k templates -x"`.
+ENTRYPOINT ["/opt/venv/bin/python", "-m", "pytest"]
+CMD ["-q"]
+
+# --------------------------------------------------------------------------- #
 # Runtime
 # --------------------------------------------------------------------------- #
 FROM python:3.12-slim AS runtime
@@ -50,16 +84,21 @@ ENV PYTHONUNBUFFERED=1 \
     HIVE_PORT=8080
 
 # UID is fixed so the PVC's fsGroup can be set to match it in the Kubernetes manifest.
+# Both mount points are created here and owned by the runtime user. That ownership is
+# what Docker copies into an empty named volume on first mount — a path that does not
+# exist in the image gets a mount point owned by root instead, and the container, running
+# as uid 10001, then fails to write with a permission error that only surfaces the first
+# time someone uploads something.
 RUN groupadd --gid 10001 hive \
     && useradd --uid 10001 --gid hive --no-create-home --shell /usr/sbin/nologin hive \
-    && mkdir -p /data \
-    && chown -R hive:hive /data
+    && mkdir -p /data /templates \
+    && chown -R hive:hive /data /templates
 
 COPY --from=builder --chown=root:root /opt/venv /opt/venv
 
 USER hive
 WORKDIR /app
-VOLUME ["/data"]
+VOLUME ["/data", "/templates"]
 EXPOSE 8080
 
 # No curl in the slim image, and adding it just for a healthcheck would widen the

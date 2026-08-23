@@ -353,6 +353,117 @@ class SheetSpec(StrictModel):
 # --------------------------------------------------------------------------- #
 
 
+# --------------------------------------------------------------------------- #
+# Editing an existing document
+# --------------------------------------------------------------------------- #
+#
+# Patches, not a round trip. An uploaded document is opened and specific things are
+# changed; it is never parsed into a spec and re-rendered, because that would discard
+# every piece of formatting the spec cannot express — which is most of them.
+#
+# Positions are 1-based throughout. That matches what `hive_read_document` prints and
+# what render errors say ("slide 2 could not be rendered"), so a model never has to
+# translate between two numbering schemes mid-task.
+
+
+class ReplaceText(StrictModel):
+    op: Literal["replace_text"] = "replace_text"
+    find: str = Field(min_length=1, description="Exact text to look for.")
+    replace: str = Field(description="What to put in its place. Empty string deletes it.")
+    match_case: bool = True
+
+
+class FillPlaceholders(StrictModel):
+    op: Literal["fill_placeholders"] = "fill_placeholders"
+    values: dict[str, str] = Field(
+        description="Values for {{placeholders}}, keyed without the braces."
+    )
+
+
+class DeleteSlide(StrictModel):
+    op: Literal["delete_slide"] = "delete_slide"
+    slide: int = Field(ge=1, description="1-based slide number, as hive_read_document "
+                       "reports it.")
+
+
+class ReorderSlides(StrictModel):
+    op: Literal["reorder_slides"] = "reorder_slides"
+    order: list[int] = Field(
+        min_length=1,
+        description="The new order as 1-based slide numbers. Must list every slide "
+        "exactly once.",
+    )
+
+
+class SetNotes(StrictModel):
+    op: Literal["set_notes"] = "set_notes"
+    slide: int = Field(ge=1)
+    notes: str
+
+
+class SetParagraph(StrictModel):
+    op: Literal["set_paragraph"] = "set_paragraph"
+    paragraph: int = Field(ge=1, description="1-based paragraph number from "
+                           "hive_read_document.")
+    text: str
+
+
+class AppendParagraph(StrictModel):
+    op: Literal["append_paragraph"] = "append_paragraph"
+    text: str
+    style: str | None = Field(
+        default=None,
+        description="A paragraph style the document defines, e.g. 'Heading 1'. "
+        "hive_read_document lists them.",
+    )
+
+
+class SetCell(StrictModel):
+    op: Literal["set_cell"] = "set_cell"
+    sheet: str
+    # The row part excludes a leading zero on purpose: "A0" parses fine as a coordinate
+    # and then fails deep inside openpyxl, where the message says nothing useful.
+    cell: str = Field(
+        pattern=r"^[A-Za-z]{1,3}[1-9][0-9]{0,6}$",
+        description="A1 notation, e.g. 'B7'. Rows start at 1.",
+    )
+    value: str | float | int | bool | None
+    type: CellType = "text"
+
+
+EditOp = Annotated[
+    ReplaceText
+    | FillPlaceholders
+    | DeleteSlide
+    | ReorderSlides
+    | SetNotes
+    | SetParagraph
+    | AppendParagraph
+    | SetCell,
+    Field(discriminator="op"),
+]
+
+
+class EditResult(StrictModel):
+    """What an edit changed, and where it ended up."""
+
+    file_id: str | None = None
+    download_url: str | None = None
+    download_markdown: str | None = Field(
+        default=None,
+        description="A ready-made markdown link. Include it verbatim in your reply so the "
+        "user can click it, or call hive_show_download for a card with a real button.",
+    )
+    filename: str
+    media_type: str
+    size_bytes: int
+    applied: list[str] = Field(
+        description="One line per operation describing what it actually changed. Worth "
+        "relaying: an operation can succeed while matching nothing."
+    )
+    warnings: list[str] = Field(default_factory=list)
+
+
 class RenderResult(StrictModel):
     """What a generation tool hands back to the model."""
 
@@ -361,6 +472,13 @@ class RenderResult(StrictModel):
     )
     download_url: str | None = Field(
         default=None, description="Signed, expiring direct download URL."
+    )
+    download_markdown: str | None = Field(
+        default=None,
+        description="A ready-made markdown link. Include it verbatim in your reply so the "
+        "user can click it: a URL inside a tool result is plain text, but your message is "
+        "rendered as markdown. For a nicer card with a real button, call "
+        "hive_show_download with the download_url instead.",
     )
     filename: str
     media_type: str

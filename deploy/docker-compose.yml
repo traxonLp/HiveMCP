@@ -13,7 +13,9 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
-    image: hivemcp:1.0.0
+    # Deliberately not a release version: this is a local build and must never be
+    # mistaken for, or overwrite, an image that CI published.
+    image: hivemcp:dev
     ports:
       - "8080:8080"
     # Secrets live in ../.env, which .gitignore excludes. Nothing secret belongs in
@@ -26,16 +28,25 @@ services:
       - path: ../.env
         required: false
     environment:
-      # Non-secret defaults only.
+      # Only values tied to this file's own volume mounts belong here, because a key in
+      # this block cannot be overridden from .env. Everything else lives there.
       #
-      # HIVE_OWUI_URL is deliberately NOT here. Pinning it to the bundled service name
-      # would override whatever you set in .env (see the precedence note above) and
+      # HIVE_OWUI_URL is the clearest case: pinned to the bundled service name it would
       # silently break every setup where OpenWebUI runs somewhere else. Set it in .env:
       #   bundled openwebui service   -> http://openwebui:8080
       #   OpenWebUI elsewhere on host -> http://host.docker.internal:3000
-      HIVE_ENVIRONMENT: dev
-      HIVE_LOG_LEVEL: INFO
-      HIVE_PUBLIC_URL: http://localhost:8080
+      #
+      # Three keys used to sit here and were moved out for the same reason:
+      #
+      #   HIVE_ENVIRONMENT  pinned to dev meant setting prod in .env did nothing, and the
+      #                     /_debug endpoints — which reflect request headers, session
+      #                     token included, back at the caller — stayed mounted in a
+      #                     deployment that believed it was hardened.
+      #   HIVE_PUBLIC_URL   pinned to localhost meant every download link pointed at the
+      #                     user's own machine as soon as this ran behind a real domain.
+      #   HIVE_LOG_LEVEL    merely annoying, but same reason.
+      #
+      # Their defaults now come from .env.example; the code defaults to dev/INFO.
       HIVE_DATA_DIR: /data
       # Separate volume: templates are curated and long-lived, artifacts churn and are
       # swept on a TTL. Keeping them apart means `make clean` does not take the

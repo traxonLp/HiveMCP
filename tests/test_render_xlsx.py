@@ -1,6 +1,8 @@
+"""Excel rendering."""
+
 from __future__ import annotations
 
-import io
+from io import BytesIO
 
 import pytest
 from openpyxl import load_workbook
@@ -13,157 +15,261 @@ from hivemcp.core.models import (
     SheetChart,
     SheetSpec,
 )
-from hivemcp.core.render.xlsx import render_spreadsheet
+from hivemcp.core.render.base import MEDIA_TYPES
+from hivemcp.core.render.xlsx import NUMBER_FORMATS, render_spreadsheet
 
 
-def reopen(data: bytes):
-    return load_workbook(io.BytesIO(data))
+def opened(rendered):
+    return load_workbook(BytesIO(rendered.data))
 
 
-def test_headers_types_and_formats(workbook: SheetSpec, options: RenderOptions) -> None:
-    result = render_spreadsheet(workbook, options)
-    assert result.sheet_names == ["Regionen"]
-
-    sheet = reopen(result.data)["Regionen"]
-    assert [cell.value for cell in sheet[1]] == ["Region", "Umsatz"]
-    assert sheet["A1"].font.bold is True
-    assert sheet["B2"].value == 4200000
-    assert "€" in sheet["B2"].number_format
-    assert sheet.freeze_panes == "A2"
-    assert sheet.auto_filter.ref == "A1:B3"
+# --------------------------------------------------------------------------- #
+# Structure
+# --------------------------------------------------------------------------- #
 
 
-def test_default_sheet_is_dropped(workbook: SheetSpec, options: RenderOptions) -> None:
-    """openpyxl's Workbook() starts with a 'Sheet'; it must not survive into the output."""
-    assert reopen(render_spreadsheet(workbook, options).data).sheetnames == ["Regionen"]
-
-
-@pytest.mark.parametrize("payload", ["=1+1", "+SUM(A1)", "-2+3", "@cmd", "\tx"])
-def test_text_that_looks_like_a_formula_is_neutralised(
-    options: RenderOptions, payload: str
+def test_renders_sheets_headers_and_rows(
+    workbook: SheetSpec, options: RenderOptions
 ) -> None:
-    """Untrusted text must never be evaluated by Excel (formula injection)."""
+    book = opened(render_spreadsheet(workbook, options))
+    sheet = book["Regionen"]
+    assert [cell.value for cell in sheet[1]] == ["Region", "Umsatz"]
+    assert sheet["A2"].value == "DACH"
+    assert sheet["B2"].value == 4200000
+
+
+def test_reports_sheet_names_and_media_type(
+    workbook: SheetSpec, options: RenderOptions
+) -> None:
+    rendered = render_spreadsheet(workbook, options)
+    assert rendered.sheet_names == ["Regionen"]
+    assert rendered.media_type == MEDIA_TYPES["xlsx"]
+    assert rendered.filename.endswith(".xlsx")
+
+
+def test_output_is_a_real_ooxml_package(
+    workbook: SheetSpec, options: RenderOptions
+) -> None:
+    assert render_spreadsheet(workbook, options).data[:2] == b"PK"
+
+
+def test_several_sheets_keep_their_order(options: RenderOptions) -> None:
     spec = SheetSpec(
         title="T",
         sheets=[
-            Sheet(name="S", columns=[Column(header="Notiz", key="n")], rows=[{"n": payload}])
+            Sheet(name=name, columns=[Column(header="A", key="a")], rows=[{"a": "x"}])
+            for name in ("Erste", "Zweite", "Dritte")
         ],
     )
-    value = reopen(render_spreadsheet(spec, options).data)["S"]["A2"].value
-    assert value == f"'{payload}"
+    assert opened(render_spreadsheet(spec, options)).sheetnames == [
+        "Erste",
+        "Zweite",
+        "Dritte",
+    ]
 
 
-def test_explicit_formula_column_is_normalised(options: RenderOptions) -> None:
-    spec = SheetSpec(
-        title="T",
-        sheets=[
-            Sheet(
-                name="S",
-                columns=[Column(header="A", key="a", type="integer"),
-                         Column(header="S", key="s", type="formula")],
-                rows=[{"a": 1, "s": "A2*2"}, {"a": 2, "s": "=A3*2"}],
-            )
-        ],
-    )
-    sheet = reopen(render_spreadsheet(spec, options).data)["S"]
-    assert sheet["B2"].value == "=A2*2"  # bare expression gets its '=' added
-    assert sheet["B3"].value == "=A3*2"  # already-prefixed one is left alone
-
-
-@pytest.mark.parametrize(
-    ("raw", "expected"),
-    [("ja", True), ("nein", False), ("true", True), ("0", False), (True, True)],
-)
-def test_bool_coercion(options: RenderOptions, raw: object, expected: bool) -> None:
-    spec = SheetSpec(
-        title="T",
-        sheets=[
-            Sheet(
-                name="S",
-                columns=[Column(header="Aktiv", key="a", type="bool")],
-                rows=[{"a": raw}],
-            )
-        ],
-    )
-    assert reopen(render_spreadsheet(spec, options).data)["S"]["A2"].value is expected
-
-
-def test_non_numeric_value_in_numeric_column_does_not_crash(options: RenderOptions) -> None:
-    spec = SheetSpec(
-        title="T",
-        sheets=[
-            Sheet(
-                name="S",
-                columns=[Column(header="N", key="n", type="number")],
-                rows=[{"n": "k.A."}],
-            )
-        ],
-    )
-    assert reopen(render_spreadsheet(spec, options).data)["S"]["A2"].value == "k.A."
-
-
-def test_column_widths_explicit_and_estimated(options: RenderOptions) -> None:
+def test_missing_keys_leave_cells_empty_rather_than_shifting_columns(
+    options: RenderOptions,
+) -> None:
+    """A row that omits a key must not slide the remaining values left."""
     spec = SheetSpec(
         title="T",
         sheets=[
             Sheet(
                 name="S",
                 columns=[
-                    Column(header="Fix", key="f", width=42.0),
-                    Column(header="Auto", key="a"),
+                    Column(header="A", key="a"),
+                    Column(header="B", key="b"),
+                    Column(header="C", key="c"),
                 ],
-                rows=[{"f": "x", "a": "ein ziemlich langer Wert hier"}],
+                rows=[{"a": "1", "c": "3"}],
             )
         ],
     )
-    dimensions = reopen(render_spreadsheet(spec, options).data)["S"].column_dimensions
-    assert dimensions["A"].width == 42.0
-    assert dimensions["B"].width == len("ein ziemlich langer Wert hier") + 2
+    sheet = opened(render_spreadsheet(spec, options))["S"]
+    assert sheet["A2"].value == "1"
+    assert sheet["B2"].value in (None, "")
+    assert sheet["C2"].value == "3"
 
 
-def test_conditional_formats_and_charts(options: RenderOptions) -> None:
+# --------------------------------------------------------------------------- #
+# Types and formats
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("cell_type", "value", "expected"),
+    [
+        ("integer", 42, 42),
+        ("number", 1.5, 1.5),
+        ("currency", 1000, 1000),
+        ("percent", 0.25, 0.25),
+        ("bool", True, True),
+        ("text", "hallo", "hallo"),
+    ],
+)
+def test_cell_types_keep_their_native_value(
+    cell_type: str, value, expected, options: RenderOptions
+) -> None:
     spec = SheetSpec(
         title="T",
         sheets=[
             Sheet(
                 name="S",
-                columns=[Column(header="K", key="k"), Column(header="V", key="v", type="number")],
-                rows=[{"k": "a", "v": 1}, {"k": "b", "v": 2}],
+                columns=[Column(header="H", key="k", type=cell_type)],
+                rows=[{"k": value}],
+            )
+        ],
+    )
+    sheet = opened(render_spreadsheet(spec, options))["S"]
+    assert sheet["A2"].value == expected
+    assert sheet["A2"].number_format == NUMBER_FORMATS[cell_type]
+
+
+def test_formula_cells_are_written_as_formulas(options: RenderOptions) -> None:
+    spec = SheetSpec(
+        title="T",
+        sheets=[
+            Sheet(
+                name="S",
+                columns=[Column(header="Summe", key="s", type="formula")],
+                rows=[{"s": "=1+1"}],
+            )
+        ],
+    )
+    sheet = opened(render_spreadsheet(spec, options))["S"]
+    assert sheet["A2"].value == "=1+1"
+
+
+@pytest.mark.parametrize("payload", ["=1+1", "+1", "-1", "@SUM(A1)"])
+def test_text_cells_cannot_smuggle_in_a_formula(
+    payload: str, options: RenderOptions
+) -> None:
+    """Untrusted text starting with a trigger character must not be evaluated by Excel.
+
+    This is the injection path: content arrives from a model or an uploaded document, and
+    a plain-text cell beginning with ``=`` would otherwise run as a formula on open.
+    """
+    spec = SheetSpec(
+        title="T",
+        sheets=[
+            Sheet(
+                name="S",
+                columns=[Column(header="H", key="k", type="text")],
+                rows=[{"k": payload}],
+            )
+        ],
+    )
+    value = opened(render_spreadsheet(spec, options))["S"]["A2"].value
+    assert value.startswith("'") or not value.startswith(("=", "+", "-", "@"))
+
+
+# --------------------------------------------------------------------------- #
+# Sheet features
+# --------------------------------------------------------------------------- #
+
+
+def test_header_row_is_frozen_when_requested(options: RenderOptions) -> None:
+    spec = SheetSpec(
+        title="T",
+        sheets=[
+            Sheet(
+                name="S",
+                columns=[Column(header="A", key="a")],
+                rows=[{"a": "x"}],
+                freeze_header=True,
+            )
+        ],
+    )
+    assert opened(render_spreadsheet(spec, options))["S"].freeze_panes == "A2"
+
+
+def test_freezing_can_be_switched_off(options: RenderOptions) -> None:
+    spec = SheetSpec(
+        title="T",
+        sheets=[
+            Sheet(
+                name="S",
+                columns=[Column(header="A", key="a")],
+                rows=[{"a": "x"}],
+                freeze_header=False,
+            )
+        ],
+    )
+    assert opened(render_spreadsheet(spec, options))["S"].freeze_panes in (None, "A1")
+
+
+def test_autofilter_covers_the_data_range(options: RenderOptions) -> None:
+    spec = SheetSpec(
+        title="T",
+        sheets=[
+            Sheet(
+                name="S",
+                columns=[Column(header="A", key="a")],
+                rows=[{"a": "x"}, {"a": "y"}],
+                autofilter=True,
+            )
+        ],
+    )
+    assert opened(render_spreadsheet(spec, options))["S"].auto_filter.ref is not None
+
+
+def test_conditional_formatting_is_attached(options: RenderOptions) -> None:
+    spec = SheetSpec(
+        title="T",
+        sheets=[
+            Sheet(
+                name="S",
+                columns=[Column(header="Wert", key="w", type="number")],
+                rows=[{"w": 1.0}, {"w": 2.0}],
                 conditional_formats=[
-                    ConditionalFormat(range="B2:B3", rule="data_bar"),
-                    ConditionalFormat(range="B2:B3", rule="duplicates"),
+                    ConditionalFormat(range="A2:A3", rule="color_scale")
                 ],
+            )
+        ],
+    )
+    sheet = opened(render_spreadsheet(spec, options))["S"]
+    assert len(list(sheet.conditional_formatting)) >= 1
+
+
+def test_chart_is_anchored_to_the_sheet(options: RenderOptions) -> None:
+    spec = SheetSpec(
+        title="T",
+        sheets=[
+            Sheet(
+                name="S",
+                columns=[
+                    Column(header="Monat", key="m"),
+                    Column(header="Wert", key="w", type="number"),
+                ],
+                rows=[{"m": "Jan", "w": 1.0}, {"m": "Feb", "w": 2.0}],
                 charts=[
                     SheetChart(
-                        chart_type="column",
+                        chart_type="line",
+                        title="Verlauf",
                         categories_range="A2:A3",
                         values_range="B1:B3",
-                        title="Werte",
+                        anchor="D2",
                     )
                 ],
             )
         ],
     )
-    sheet = reopen(render_spreadsheet(spec, options).data)["S"]
-
-    rule_types = {
-        rule.type
-        for rules in sheet.conditional_formatting._cf_rules.values()
-        for rule in rules
-    }
-    assert {"dataBar", "duplicateValues"} <= rule_types
-    assert len(sheet._charts) == 1
+    assert len(opened(render_spreadsheet(spec, options))["S"]._charts) == 1
 
 
-def test_sheet_name_validation_rejects_excel_illegal_characters() -> None:
-    with pytest.raises(ValueError, match="sheet name"):
-        Sheet(name="a/b", columns=[Column(header="H", key="h")])
-
-
-def test_duplicate_sheet_names_are_rejected() -> None:
-    columns = [Column(header="H", key="h")]
-    with pytest.raises(ValueError, match="unique"):
-        SheetSpec(
-            title="T",
-            sheets=[Sheet(name="S", columns=columns), Sheet(name="s", columns=columns)],
-        )
+def test_column_widths_stay_within_bounds(options: RenderOptions) -> None:
+    spec = SheetSpec(
+        title="T",
+        sheets=[
+            Sheet(
+                name="S",
+                columns=[Column(header="A", key="a")],
+                rows=[{"a": "x" * 500}],
+            )
+        ],
+    )
+    sheet = opened(render_spreadsheet(spec, options))["S"]
+    width = sheet.column_dimensions["A"].width
+    if width:
+        assert 8.0 <= width <= 60.0

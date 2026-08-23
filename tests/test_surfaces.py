@@ -16,10 +16,21 @@ from hivemcp.app import create_app
 from hivemcp.auth import Identity
 from hivemcp.config import Settings
 
+# Every tool the MCP surface registers. Pinned exactly, so adding or renaming one is a
+# deliberate edit here rather than something that quietly changes what models can call.
 EXPECTED_TOOLS = {
     "hive_create_presentation",
     "hive_create_document",
     "hive_create_spreadsheet",
+    "hive_read_document",
+    "hive_edit_document",
+    "hive_list_templates",
+    "hive_inspect_template",
+    "hive_upload_template",
+    "hive_delete_template",
+    # The only unauthenticated one: it returns the bundled usage guide, which has to stay
+    # reachable when a misconfigured connection is making every other tool return 401.
+    "hive_usage_guide",
 }
 
 MINIMAL_DECK = {

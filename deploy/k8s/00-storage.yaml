@@ -7,7 +7,7 @@
 # without the large disposable one, and a runaway render cannot fill the disk that holds
 # the corporate designs.
 #
-#   kubectl apply -f deploy/k8s/templates-pvc.yaml
+#   kubectl apply -f deploy/k8s/
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -44,38 +44,5 @@ spec:
       # Rendered documents awaiting download, swept after HIVE_TMP_TTL_MINUTES.
       storage: 10Gi
   # storageClassName: nfs-client
----
-# Excerpt showing how the deployment consumes both. Not a complete Deployment.
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: hivemcp-volume-example
-data:
-  deployment-excerpt.yaml: |
-    spec:
-      template:
-        spec:
-          securityContext:
-            # Matches the image's uid/gid so both volumes are writable without root.
-            runAsNonRoot: true
-            runAsUser: 10001
-            fsGroup: 10001
-          containers:
-            - name: hivemcp
-              env:
-                - name: HIVE_DATA_DIR
-                  value: /data
-                - name: HIVE_TEMPLATES_DIR
-                  value: /templates
-              volumeMounts:
-                - name: data
-                  mountPath: /data
-                - name: templates
-                  mountPath: /templates
-          volumes:
-            - name: data
-              persistentVolumeClaim:
-                claimName: hivemcp-data
-            - name: templates
-              persistentVolumeClaim:
-                claimName: hivemcp-templates
+# Both volumes are consumed by 02-deployment.yaml, which sets fsGroup 10001 to match the
+# image's uid so neither needs root to be writable.

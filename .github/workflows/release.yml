@@ -1,0 +1,186 @@
+name: release
+
+# Every push to main: run the suite, bump the patch version, publish the image to GHCR,
+# tag the commit and open a GitHub Release.
+#
+# The loop this could cause is the thing to understand before editing anything here. The
+# job pushes a commit back to main, and a push to main is what triggers the job. Two
+# guards, deliberately overlapping:
+#
+#   1. The push uses GITHUB_TOKEN. GitHub does not start workflow runs for pushes made
+#      with that token — this is the mechanism that actually holds.
+#   2. The commit message carries [skip ci], and the job checks for it. Redundant while
+#      guard 1 works, and the only thing left if someone swaps in a PAT, which does
+#      trigger runs and would otherwise spin the repository forever.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      # Documentation alone does not justify a new image.
+      - "**.md"
+      - "docs/**"
+      - ".gitignore"
+  workflow_dispatch:
+
+# A release that is half-done is worse than one that is late: cancelling between the
+# image push and the git tag would leave a published image no commit points at.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  test:
+    name: test suite
+    runs-on: ubuntu-latest
+    # Guard 2. See the note at the top.
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          target: test
+          load: true
+          tags: hivemcp-test:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run the suite
+        # pytest is the image's entrypoint, so arguments pass straight through.
+        run: docker run --rm hivemcp-test:ci -q -rf --tb=short
+
+  release:
+    name: publish
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # commit the bump, push the tag, create the release
+      packages: write # push to GHCR
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The tag push needs the history; a shallow clone cannot describe it.
+          fetch-depth: 0
+
+      - name: Work out the next version
+        id: version
+        run: |
+          set -euo pipefail
+          current=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
+          if [[ ! "$current" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version in pyproject.toml is '$current', not MAJOR.MINOR.PATCH"
+            exit 1
+          fi
+          IFS=. read -r major minor patch <<< "$current"
+          next="$major.$minor.$((patch + 1))"
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+          echo "Bumping $current -> $next"
+
+      - name: Lowercase the image name
+        id: image
+        # GHCR rejects uppercase in a repository path, and GitHub owner names may
+        # contain it. Deriving this instead of hardcoding keeps a fork working.
+        run: |
+          echo "name=${REGISTRY}/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Apply the version
+        run: |
+          set -euo pipefail
+          next='${{ steps.version.outputs.next }}'
+          image='${{ steps.image.outputs.name }}'
+
+          # pyproject.toml is the single source of truth; the application reads it back
+          # through importlib.metadata rather than repeating it.
+          sed -i "s|^version = \".*\"|version = \"$next\"|" pyproject.toml
+
+          # The Kubernetes manifest pins a tag on purpose — :latest there means a
+          # rollback has nothing to roll back to.
+          sed -i "s|^\( *\)image: .*hivemcp:.*|\1image: $image:$next|" deploy/k8s/02-deployment.yaml
+          sed -i "s|app.kubernetes.io/version: .*|app.kubernetes.io/version: \"$next\"|" \
+            deploy/k8s/02-deployment.yaml
+
+          git diff --stat
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          target: runtime
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ steps.version.outputs.next }}
+            ${{ steps.image.outputs.name }}:latest
+            ${{ steps.image.outputs.name }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.next }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Commit and tag
+        # Only now, after the image is published. The reverse order can leave a tag
+        # pointing at a version that was never built.
+        run: |
+          set -euo pipefail
+          next='${{ steps.version.outputs.next }}'
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml deploy/k8s/02-deployment.yaml
+          git commit -m "chore(release): v$next [skip ci]"
+          git tag -a "v$next" -m "v$next"
+          git push origin HEAD:main
+          git push origin "v$next"
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          next='${{ steps.version.outputs.next }}'
+          image='${{ steps.image.outputs.name }}'
+
+          # Written to a file rather than passed inline: a multi-line --notes argument
+          # keeps the YAML block's indentation, and four leading spaces turn the whole
+          # thing into a Markdown code block.
+          cat > /tmp/notes.md <<EOF
+          ## Image
+
+          \`\`\`
+          docker pull $image:$next
+          \`\`\`
+
+          Also tagged \`latest\` and \`sha-${{ github.sha }}\`.
+          EOF
+          sed -i 's/^          //' /tmp/notes.md
+
+          # --notes is *prepended* to the generated notes, which is documented
+          # behaviour, so the image block sits above the commit list.
+          # --verify-tag aborts rather than silently creating a tag, which would hide
+          # the previous step having failed to push one.
+          gh release create "v$next" \
+            --title "v$next" \
+            --verify-tag \
+            --generate-notes \
+            --notes-file /tmp/notes.md

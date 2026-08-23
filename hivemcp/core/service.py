@@ -15,19 +15,58 @@ from typing import Any
 from ..auth import Caller, RateLimiter
 from ..config import Settings
 from .delivery import Delivery
+from .editing.apply import EditError, apply_edits
+from .editing.read import DocumentUnreadable, read_document as _read_document_file
 from .files.owui_client import OwuiError, OwuiFilesClient
 from .llm.client import OwuiChatClient
 from .llm.expand import ExpansionError, expand_brief
 from .llm.resolver import ModelUnavailable, resolve_model
-from .models import DeckSpec, DocSpec, RenderOptions, RenderResult, SheetSpec
+from .models import DeckSpec, DocSpec, EditResult, RenderOptions, RenderResult, SheetSpec
 from .render.base import RenderedFile, RenderError
 from .render.docx import render_document
 from .render.pptx import render_presentation
+from .render.theme import safe_filename
 from .render.xlsx import render_spreadsheet
 from .templates.service import TemplateService
 from .templates.store import TemplateError
 
 logger = logging.getLogger(__name__)
+
+# The first bytes of an OOXML part, used to tell the three formats apart. Reading the
+# zip's own directory is what makes this reliable: the container is a plain zip for all
+# three, so only the parts inside distinguish them.
+_OOXML_MARKERS: tuple[tuple[str, str], ...] = (
+    ("ppt/presentation.xml", "pptx"),
+    ("word/document.xml", "docx"),
+    ("xl/workbook.xml", "xlsx"),
+)
+
+
+def detect_kind(data: bytes) -> str | None:
+    """Identify a document by what is inside it, not by what it is called."""
+    import zipfile
+    from io import BytesIO
+
+    try:
+        with zipfile.ZipFile(BytesIO(data)) as archive:
+            names = set(archive.namelist())
+    except zipfile.BadZipFile:
+        return None
+    for marker, kind in _OOXML_MARKERS:
+        if marker in names:
+            return kind
+    return None
+
+
+def _read_bytes(data: bytes, kind: str, mode: str) -> dict[str, Any]:
+    """Write the upload to a temporary file so the parsers can open it by path."""
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / f"upload.{kind}"
+        path.write_bytes(data)
+        return _read_document_file(path, kind, mode)  # type: ignore[arg-type]
 
 
 class ToolError(Exception):
@@ -120,6 +159,72 @@ class DocumentService:
             render_spreadsheet, spec, options, template_path=template
         )
         return await self._deliver(rendered, caller, notes)
+
+    # ------------------------------------------------------- editing uploads
+
+    async def read_document(
+        self, caller: Caller, file_id: str, mode: str = "outline"
+    ) -> dict[str, Any]:
+        """Read a file the user attached to the chat."""
+        data, kind = await self._fetch_upload(caller, file_id)
+        try:
+            return await asyncio.to_thread(_read_bytes, data, kind, mode)
+        except DocumentUnreadable as exc:
+            raise ToolError(str(exc)) from exc
+
+    async def edit_document(
+        self,
+        caller: Caller,
+        file_id: str,
+        operations: list[Any],
+        filename: str | None = None,
+    ) -> EditResult:
+        """Apply edit operations to an uploaded file and deliver the result as a new one.
+
+        The original is never modified: the user may well still want it, and OpenWebUI's
+        Files API has no notion of a version. The edit comes back as a separate upload.
+        """
+        data, kind = await self._fetch_upload(caller, file_id)
+        target = safe_filename(filename, f"edited-document", kind)
+
+        async with self._semaphore:
+            try:
+                rendered, applied = await asyncio.to_thread(
+                    apply_edits, data, kind, operations, target
+                )
+            except (EditError, DocumentUnreadable) as exc:
+                raise ToolError(str(exc)) from exc
+
+        result = await self.delivery.deliver(rendered, caller)
+        return EditResult(
+            file_id=result.file_id,
+            download_url=result.download_url,
+            download_markdown=self._markdown_link(result.download_url, rendered.filename),
+            filename=rendered.filename,
+            media_type=rendered.media_type,
+            size_bytes=rendered.size_bytes,
+            applied=applied,
+            warnings=[*rendered.warnings, *result.warnings],
+        )
+
+    async def _fetch_upload(self, caller: Caller, file_id: str) -> tuple[bytes, str]:
+        """Download a chat attachment and work out which kind of document it is.
+
+        The kind comes from the bytes, not from a filename: OpenWebUI's file id carries
+        no extension, and an uploaded name is a claim rather than a fact.
+        """
+        try:
+            data = await self.owui.get_content(file_id, caller.token)
+        except OwuiError as exc:
+            raise ToolError(str(exc)) from exc
+
+        kind = detect_kind(data)
+        if kind is None:
+            raise ToolError(
+                "That file is not a PowerPoint, Word or Excel document. HiveMCP can only "
+                "read and edit .pptx, .docx and .xlsx files."
+            )
+        return data, kind
 
     # --------------------------------------------------------------- helpers
 
@@ -223,6 +328,20 @@ class DocumentService:
                 logger.exception("unexpected render failure")
                 raise RenderError(f"the document could not be built: {exc}") from exc
 
+    @staticmethod
+    def _markdown_link(url: str | None, filename: str) -> str | None:
+        """A link the model can paste straight into its reply.
+
+        A URL inside a tool result is plain text: OpenWebUI renders tool results as JSON,
+        and only the assistant's own message goes through markdown. Handing the model a
+        finished link is what makes the download clickable at all.
+        """
+        if not url:
+            return None
+        # Parentheses in a filename would end the markdown target early.
+        safe = filename.replace("[", "(").replace("]", ")")
+        return f"[⬇ {safe}]({url})"
+
     async def _deliver(
         self, rendered: RenderedFile, caller: Caller, notes: list[str] | None = None
     ) -> RenderResult:
@@ -230,6 +349,7 @@ class DocumentService:
         return RenderResult(
             file_id=result.file_id,
             download_url=result.download_url,
+            download_markdown=self._markdown_link(result.download_url, rendered.filename),
             filename=rendered.filename,
             media_type=rendered.media_type,
             size_bytes=rendered.size_bytes,

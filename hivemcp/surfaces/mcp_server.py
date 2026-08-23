@@ -33,13 +33,17 @@ import logging
 from typing import Any
 
 from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver.prompts import Prompt
 from starlette.types import ASGIApp
 
+from .. import __version__
 from ..auth import AuthError, Caller, SessionValidator, authenticate
 from ..config import Settings
-from ..core.models import DeckSpec, DocSpec, RenderOptions, SheetSpec
+from ..core.editing.read import ReadMode
+from ..core.models import DeckSpec, DocSpec, EditOp, RenderOptions, SheetSpec
 from ..core.render.base import RenderError
 from ..core.service import DocumentService, ToolError
+from ..core.skills import SkillError, SkillRegistry
 from ..core.templates.service import TemplateService
 from ..core.templates.store import TemplateError, TemplateKind
 
@@ -84,22 +88,76 @@ def _fail(exc: Exception) -> Exception:
     return ValueError(str(exc))
 
 
+def _register_skills(mcp: MCPServer, skills: SkillRegistry) -> None:
+    """Expose every bundled skill as an MCP prompt and as one always-available tool.
+
+    Neither is authenticated, and that is deliberate. These return documentation that
+    ships inside the image — no user data, no side effects, nothing that varies by
+    caller. Gating them behind a session token would make the guide unavailable in
+    exactly the situation where it is most useful: a connection whose authentication is
+    misconfigured, where every other tool is already failing and the model needs to be
+    told why.
+
+    A prompt returning a plain string becomes a single user message; that is the SDK's
+    documented behaviour and avoids hand-building message objects here.
+    """
+    for skill in skills.all():
+        def make(body: str, description: str):  # noqa: ANN202 - closure over the loop var
+            def prompt() -> str:
+                return body
+
+            prompt.__doc__ = description
+            return prompt
+
+        mcp.add_prompt(
+            Prompt.from_function(
+                make(skill.body, skill.description),
+                name=skill.name.replace("-", "_"),
+                title=skill.title,
+                description=skill.description,
+            )
+        )
+
+    @mcp.tool(
+        name="hive_usage_guide",
+        description=(
+            "Read the guide to using HiveMCP: which tool to call for which request, how "
+            "to write a spec that renders correctly, how templates and editing work. "
+            "Call this first if you are unsure how to build a document here, or if a "
+            "call failed validation and you want to know the correct shape."
+        ),
+    )
+    async def usage_guide(name: str | None = None) -> dict[str, Any]:
+        if name is None:
+            skill = skills.default
+            if skill is None:
+                raise ValueError("this server ships no usage guide")
+        else:
+            try:
+                skill = skills.get(name)
+            except SkillError as exc:
+                raise _fail(exc) from exc
+        return {"available": skills.names(), **skill.to_dict()}
+
+
 def build_mcp_server(
     service: DocumentService,
     validator: SessionValidator,
     templates: TemplateService,
+    skills: SkillRegistry | None = None,
 ) -> MCPServer:
     # Name stays positional, everything else by keyword: v2 inserted `title` and
     # `description` before `instructions`, so a positional second argument silently
     # lands in `title` and the instructions never reach the model.
-    mcp = MCPServer("HiveMCP", instructions=INSTRUCTIONS, version="1.0.0")
+    mcp = MCPServer("HiveMCP", instructions=INSTRUCTIONS, version=__version__)
 
     @mcp.tool(
         name="hive_create_presentation",
         description=(
-            "Create a PowerPoint (.pptx) file from a structured slide specification and "
-            "deliver it to the chat. Write the slide content yourself and pass it as "
-            "'spec'."
+            "Create a real PowerPoint file the user can download. Use this whenever "
+            "someone asks for a presentation, slides, a deck or a .pptx - do not write "
+            "the slides out as text instead. You compose the content and pass it as "
+            "'spec'; this server renders the file."
         ),
     )
     async def create_presentation(
@@ -120,8 +178,10 @@ def build_mcp_server(
     @mcp.tool(
         name="hive_create_document",
         description=(
-            "Create a Word (.docx) file from a structured list of blocks (headings, "
-            "paragraphs, lists, tables, images) and deliver it to the chat."
+            "Create a real Word file the user can download. Use this whenever someone "
+            "asks for a document, report, letter, memo or a .docx rather than answering "
+            "with the text itself. Content is a list of blocks: headings, paragraphs, "
+            "lists, tables, images."
         ),
     )
     async def create_document(
@@ -142,8 +202,9 @@ def build_mcp_server(
     @mcp.tool(
         name="hive_create_spreadsheet",
         description=(
-            "Create an Excel (.xlsx) workbook from a structured sheet specification, "
-            "including number formats, conditional formatting and charts."
+            "Create a real Excel file the user can download. Use this whenever someone "
+            "asks for a spreadsheet, workbook or an .xlsx rather than printing a markdown "
+            "table. Supports number formats, conditional formatting and charts."
         ),
     )
     async def create_spreadsheet(
@@ -158,6 +219,46 @@ def build_mcp_server(
                 caller, options=options, spec=spec, brief=brief
             )
         except (ToolError, RenderError) as exc:
+            raise _fail(exc) from exc
+        return result.model_dump(exclude_none=True)
+
+    @mcp.tool(
+        name="hive_read_document",
+        description=(
+            "Read a .pptx, .docx or .xlsx the user attached to this chat and report its "
+            "structure. Call this before hive_edit_document: it gives you the slide "
+            "numbers, paragraph numbers, sheet names and styles the edit operations "
+            "refer to. Use mode='outline' unless you need the full text."
+        ),
+    )
+    async def read_document(
+        file_id: str, mode: ReadMode = "outline", ctx: Context | None = None
+    ) -> dict[str, Any]:
+        caller = await _caller_from_context(validator, ctx)
+        try:
+            return await service.read_document(caller, file_id, mode)
+        except ToolError as exc:
+            raise _fail(exc) from exc
+
+    @mcp.tool(
+        name="hive_edit_document",
+        description=(
+            "Change specific things in a document from the chat. The file is patched, "
+            "not rebuilt, so its formatting survives, and the original is left alone. "
+            "Operations are applied in order, all or nothing. Check the returned "
+            "'applied' list: an operation can succeed while matching nothing."
+        ),
+    )
+    async def edit_document(
+        file_id: str,
+        operations: list[EditOp],
+        filename: str | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        caller = await _caller_from_context(validator, ctx)
+        try:
+            result = await service.edit_document(caller, file_id, operations, filename)
+        except ToolError as exc:
             raise _fail(exc) from exc
         return result.model_dump(exclude_none=True)
 
@@ -231,6 +332,8 @@ def build_mcp_server(
         except TemplateError as exc:
             raise _fail(exc) from exc
         return {"deleted": template_id}
+
+    _register_skills(mcp, skills or SkillRegistry())
 
     return mcp
 

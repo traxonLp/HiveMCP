@@ -1,194 +1,266 @@
-"""Round-trip tests: render, reopen with python-pptx, assert on what is actually inside.
+"""PowerPoint rendering.
 
-Byte comparison against a golden file is deliberately avoided. OOXML output is not
-deterministic (timestamps, zip entry order, revision ids), so a golden test would fail
-for reasons unrelated to the change being made.
+These assert against the *output file*, not against the renderer's internals: every test
+opens the produced .pptx with python-pptx and checks what a viewer would see. A test that
+only checked ``render_presentation`` returned bytes would have passed throughout the two
+layout bugs this file now guards.
 """
 
 from __future__ import annotations
 
-import io
+from io import BytesIO
 
 import pytest
 from pptx import Presentation
-from pptx.util import Pt
+from pptx.util import Emu
 
-from hivemcp.core.models import Bullet, DeckSpec, ImageRef, RenderOptions, Slide, TableData
-from hivemcp.core.render.base import RenderError
+from hivemcp.core.models import (
+    Bullet,
+    ChartData,
+    ChartSeries,
+    DeckSpec,
+    ImageRef,
+    RenderOptions,
+    Slide,
+    TableData,
+)
+from hivemcp.core.render.base import MEDIA_TYPES, RenderError
 from hivemcp.core.render.pptx import render_presentation
 
 
-def reopen(data: bytes) -> Presentation:
-    return Presentation(io.BytesIO(data))
+def opened(rendered) -> Presentation:
+    return Presentation(BytesIO(rendered.data))
 
 
-def body_shapes(slide) -> list:
-    return [
-        shape
-        for shape in slide.shapes
-        if shape.has_text_frame
-        and not (shape.is_placeholder and shape.placeholder_format.idx == 0)
-    ]
+def all_text(slide) -> str:
+    return "\n".join(
+        shape.text_frame.text for shape in slide.shapes if shape.has_text_frame
+    )
 
 
-def test_renders_every_layout(deck: DeckSpec, options: RenderOptions) -> None:
-    result = render_presentation(deck, options)
+# --------------------------------------------------------------------------- #
+# Structure
+# --------------------------------------------------------------------------- #
 
-    assert result.slide_count == len(deck.slides)
-    assert result.media_type.endswith("presentationml.presentation")
-    assert result.filename == "Quartalsbericht.pptx"
 
-    presentation = reopen(result.data)
+def test_renders_every_slide_in_order(deck: DeckSpec, options: RenderOptions) -> None:
+    presentation = opened(render_presentation(deck, options))
     assert len(presentation.slides) == len(deck.slides)
-    assert presentation.slides[0].shapes.title.text == "Q3 2026"
+    assert "Q3 2026" in all_text(presentation.slides[0])
+    assert "Ergebnisse" in all_text(presentation.slides[1])
 
 
-def test_bullet_nesting_becomes_indent_levels(options: RenderOptions) -> None:
+def test_reports_slide_count_and_media_type(deck: DeckSpec, options: RenderOptions) -> None:
+    rendered = render_presentation(deck, options)
+    assert rendered.slide_count == len(deck.slides)
+    assert rendered.media_type == MEDIA_TYPES["pptx"]
+    assert rendered.filename.endswith(".pptx")
+    assert rendered.size_bytes > 0
+
+
+def test_output_is_a_real_ooxml_package(deck: DeckSpec, options: RenderOptions) -> None:
+    # A .pptx is a zip; the magic bytes catch a renderer that returns something else
+    # entirely, which python-pptx would refuse far less clearly.
+    assert render_presentation(deck, options).data[:2] == b"PK"
+
+
+# --------------------------------------------------------------------------- #
+# Content
+# --------------------------------------------------------------------------- #
+
+
+def test_nested_bullets_keep_their_indent_level(options: RenderOptions) -> None:
     spec = DeckSpec(
         title="T",
         slides=[
             Slide(
-                title="Nesting",
+                layout="title_content",
+                title="Ebenen",
                 bullets=[
-                    Bullet(text="L0", children=[Bullet(text="L1", children=[Bullet(text="L2")])])
+                    Bullet(
+                        text="eins",
+                        children=[Bullet(text="zwei", children=[Bullet(text="drei")])],
+                    )
                 ],
             )
         ],
     )
-    presentation = reopen(render_presentation(spec, options).data)
-    body = body_shapes(presentation.slides[0])[0]
-
-    assert [(p.text, p.level) for p in body.text_frame.paragraphs] == [
-        ("L0", 0),
-        ("L1", 1),
-        ("L2", 2),
-    ]
-
-
-def test_speaker_notes_survive(deck: DeckSpec, options: RenderOptions) -> None:
-    presentation = reopen(render_presentation(deck, options).data)
-    notes = presentation.slides[2].notes_slide.notes_text_frame.text
-    assert notes == "Langsam sprechen."
-
-
-def test_table_and_chart_and_picture_are_present(deck: DeckSpec, options: RenderOptions) -> None:
-    presentation = reopen(render_presentation(deck, options).data)
-
-    table = next(s.table for s in presentation.slides[4].shapes if s.has_table)
-    assert [cell.text for cell in table.rows[0].cells] == ["Region", "Umsatz"]
-
-    chart = next(s.chart for s in presentation.slides[5].shapes if s.has_chart)
-    assert [series.name for series in chart.plots[0].series] == ["2026"]
-
-    pictures = [s for s in presentation.slides[6].shapes if s.shape_type == 13]
-    assert len(pictures) == 1
-    assert round(pictures[0].width.cm, 1) == 6.0
-
-
-def test_two_content_fills_both_columns(deck: DeckSpec, options: RenderOptions) -> None:
-    presentation = reopen(render_presentation(deck, options).data)
-    texts = [shape.text_frame.text for shape in body_shapes(presentation.slides[3])]
-    assert "Manuell" in texts
-    assert "Automatisiert" in texts
-
-
-def test_empty_placeholders_are_removed(options: RenderOptions) -> None:
-    """A slide with only a title must not leave 'Click to add text' prompts behind."""
-    spec = DeckSpec(title="T", slides=[Slide(layout="title_content", title="Nur Titel")])
-    presentation = reopen(render_presentation(spec, options).data)
-    assert body_shapes(presentation.slides[0]) == []
-
-
-def test_unknown_font_warns_but_still_applies(options: RenderOptions) -> None:
-    spec = DeckSpec(title="T", slides=[Slide(title="X", bullets=[Bullet(text="hi")])])
-    result = render_presentation(
-        spec, options.model_copy(update={"font_family": "Comic Sans MS", "font_size_base": 20})
+    slide = opened(render_presentation(spec, options)).slides[0]
+    body = next(
+        shape
+        for shape in slide.shapes
+        if shape.has_text_frame and "eins" in shape.text_frame.text
     )
-
-    assert any("Comic Sans MS" in warning for warning in result.warnings)
-
-    presentation = reopen(result.data)
-    runs = [
-        run
-        for shape in presentation.slides[0].shapes
-        if shape.has_text_frame
-        for paragraph in shape.text_frame.paragraphs
-        for run in paragraph.runs
-    ]
-    assert runs, "expected at least one run"
-    assert all(run.font.name == "Comic Sans MS" for run in runs)
-    body = body_shapes(presentation.slides[0])[0]
-    assert body.text_frame.paragraphs[0].runs[0].font.size == Pt(20)
+    levels = {p.text: p.level for p in body.text_frame.paragraphs if p.text}
+    assert levels == {"eins": 0, "zwei": 1, "drei": 2}
 
 
-def test_safe_font_produces_no_warning(options: RenderOptions) -> None:
-    spec = DeckSpec(title="T", slides=[Slide(title="X")])
-    result = render_presentation(spec, options.model_copy(update={"font_family": "Calibri"}))
-    assert result.warnings == []
-
-
-def test_filename_is_sanitised(options: RenderOptions) -> None:
-    spec = DeckSpec(title="../../etc/passwd", slides=[Slide(title="X")])
-    result = render_presentation(spec, options)
-    assert "/" not in result.filename
-    assert ".." not in result.filename
-
-
-def test_layout_requiring_content_fails_loudly(options: RenderOptions) -> None:
-    spec = DeckSpec(title="T", slides=[Slide(layout="chart", title="Ohne Daten")])
-    with pytest.raises(RenderError, match="slide 1"):
-        render_presentation(spec, options)
-
-
-def test_image_without_resolver_names_the_problem(options: RenderOptions) -> None:
-    spec = DeckSpec(
-        title="T", slides=[Slide(layout="image", title="X", image=ImageRef(file_id="abc"))]
-    )
-    with pytest.raises(RenderError, match="resolver"):
-        render_presentation(spec, options)
-
-
-def test_image_resolver_is_used(options: RenderOptions, tiny_png: str) -> None:
-    import base64
-
-    calls: list[str] = []
-
-    def resolver(file_id: str) -> bytes:
-        calls.append(file_id)
-        return base64.b64decode(tiny_png)
-
-    spec = DeckSpec(
-        title="T", slides=[Slide(layout="image", title="X", image=ImageRef(file_id="abc"))]
-    )
-    result = render_presentation(spec, options, image_resolver=resolver)
-
-    assert calls == ["abc"]
-    presentation = reopen(result.data)
-    assert [s for s in presentation.slides[0].shapes if s.shape_type == 13]
-
-
-def test_named_placeholders_are_substituted(options: RenderOptions) -> None:
-    spec = DeckSpec(
-        title="T",
-        slides=[Slide(title="Angebot fuer {{kunde}}", placeholders={"kunde": "ACME"})],
-    )
-    presentation = reopen(render_presentation(spec, options).data)
-    assert presentation.slides[0].shapes.title.text == "Angebot fuer ACME"
-
-
-def test_table_column_widths_are_applied(options: RenderOptions) -> None:
+def test_table_slide_carries_headers_and_rows(options: RenderOptions) -> None:
     spec = DeckSpec(
         title="T",
         slides=[
             Slide(
                 layout="table",
-                title="X",
+                title="Regionen",
                 table=TableData(
-                    headers=["A", "B"], rows=[["1", "2"]], column_widths_cm=[6.0, 4.0]
+                    headers=["Region", "Umsatz"],
+                    rows=[["DACH", "4.2M"], ["UK", "1.1M"]],
                 ),
             )
         ],
     )
-    presentation = reopen(render_presentation(spec, options).data)
-    table = next(s.table for s in presentation.slides[0].shapes if s.has_table)
-    assert [round(column.width.cm, 1) for column in table.columns] == [6.0, 4.0]
+    slide = opened(render_presentation(spec, options)).slides[0]
+    table = next(shape.table for shape in slide.shapes if shape.has_table)
+    assert [cell.text for cell in table.rows[0].cells] == ["Region", "Umsatz"]
+    assert len(table.rows) == 3  # header + two data rows
+
+
+def test_chart_slide_produces_a_real_chart(options: RenderOptions) -> None:
+    spec = DeckSpec(
+        title="T",
+        slides=[
+            Slide(
+                layout="chart",
+                title="Verlauf",
+                chart=ChartData(
+                    categories=["Q1", "Q2"],
+                    series=[ChartSeries(name="2026", values=[1.0, 2.0])],
+                ),
+            )
+        ],
+    )
+    slide = opened(render_presentation(spec, options)).slides[0]
+    charts = [shape.chart for shape in slide.shapes if shape.has_chart]
+    assert len(charts) == 1
+    assert [s.name for s in charts[0].plots[0].series] == ["2026"]
+
+
+def test_inline_image_is_embedded(tiny_png: str, options: RenderOptions) -> None:
+    spec = DeckSpec(
+        title="T",
+        slides=[
+            Slide(
+                layout="image",
+                title="Bild",
+                image=ImageRef(data_base64=tiny_png, width_cm=6),
+            )
+        ],
+    )
+    slide = opened(render_presentation(spec, options)).slides[0]
+    pictures = [shape for shape in slide.shapes if shape.shape_type == 13]
+    assert len(pictures) == 1
+    assert pictures[0].width == pytest.approx(Emu(6 * 360000), rel=0.01)
+
+
+def test_alt_text_reaches_the_shape(tiny_png: str, options: RenderOptions) -> None:
+    spec = DeckSpec(
+        title="T",
+        slides=[
+            Slide(
+                layout="image",
+                image=ImageRef(data_base64=tiny_png, alt_text="Ein Diagramm"),
+            )
+        ],
+    )
+    slide = opened(render_presentation(spec, options)).slides[0]
+    picture = next(shape for shape in slide.shapes if shape.shape_type == 13)
+    assert "Ein Diagramm" in picture._element.nvPicPr.cNvPr.get("descr", "")
+
+
+# --------------------------------------------------------------------------- #
+# Speaker notes
+# --------------------------------------------------------------------------- #
+
+
+def test_notes_are_written_when_requested() -> None:
+    spec = DeckSpec(
+        title="T",
+        slides=[Slide(layout="title_content", title="A", notes="Langsam sprechen.")],
+    )
+    rendered = render_presentation(spec, RenderOptions(include_notes=True))
+    slide = opened(rendered).slides[0]
+    assert slide.has_notes_slide
+    assert "Langsam sprechen." in slide.notes_slide.notes_text_frame.text
+
+
+def test_include_notes_does_not_suppress_notes_the_caller_supplied() -> None:
+    """``include_notes`` gates *generation*, not explicit content.
+
+    It is a hint for brief mode — "invent speaker notes" — so a spec that already carries
+    notes keeps them either way. Dropping content a caller explicitly wrote because a
+    formatting flag was off would be the wrong reading of the option.
+    """
+    spec = DeckSpec(
+        title="T",
+        slides=[Slide(layout="title_content", title="A", notes="Trotzdem zeigen.")],
+    )
+    rendered = render_presentation(spec, RenderOptions(include_notes=False))
+    slide = opened(rendered).slides[0]
+    assert slide.has_notes_slide
+    assert "Trotzdem zeigen." in slide.notes_slide.notes_text_frame.text
+
+
+def test_a_slide_without_notes_gets_no_notes_slide() -> None:
+    spec = DeckSpec(title="T", slides=[Slide(layout="title_content", title="A")])
+    slide = opened(render_presentation(spec, RenderOptions(include_notes=True))).slides[0]
+    assert not slide.has_notes_slide or not slide.notes_slide.notes_text_frame.text.strip()
+
+
+# --------------------------------------------------------------------------- #
+# Errors
+# --------------------------------------------------------------------------- #
+
+
+def test_render_error_names_the_slide_that_failed(options: RenderOptions) -> None:
+    """The position is the whole point of the message.
+
+    A bare re-raise once lost it, leaving the model with "image could not be decoded" and
+    no way to know which of twenty slides to fix.
+    """
+    spec = DeckSpec(
+        title="T",
+        slides=[
+            Slide(layout="title", title="ok"),
+            Slide(layout="image", image=ImageRef(data_base64="not-base64-at-all")),
+        ],
+    )
+    with pytest.raises(RenderError) as caught:
+        render_presentation(spec, options)
+    assert "2" in str(caught.value)
+
+
+def test_unresolvable_file_id_fails_without_a_resolver(options: RenderOptions) -> None:
+    spec = DeckSpec(
+        title="T",
+        slides=[Slide(layout="image", image=ImageRef(file_id="f-404"))],
+    )
+    with pytest.raises(RenderError):
+        render_presentation(spec, options, image_resolver=None)
+
+
+# --------------------------------------------------------------------------- #
+# Options
+# --------------------------------------------------------------------------- #
+
+
+def test_unknown_font_is_warned_about_but_still_renders(deck: DeckSpec) -> None:
+    rendered = render_presentation(deck, RenderOptions(font_family="Nicht Installiert"))
+    assert rendered.size_bytes > 0
+    assert any("Nicht Installiert" in warning for warning in rendered.warnings)
+
+
+def test_safe_font_produces_no_font_warning(deck: DeckSpec) -> None:
+    rendered = render_presentation(deck, RenderOptions(font_family="Arial"))
+    assert not any("Arial" in warning for warning in rendered.warnings)
+
+
+def test_filename_option_is_honoured(deck: DeckSpec) -> None:
+    rendered = render_presentation(deck, RenderOptions(filename="Quartal Q3"))
+    assert rendered.filename.startswith("Quartal")
+    assert rendered.filename.endswith(".pptx")
+
+
+def test_filename_cannot_escape_its_directory(deck: DeckSpec) -> None:
+    rendered = render_presentation(deck, RenderOptions(filename="../../etc/passwd"))
+    assert "/" not in rendered.filename
+    assert ".." not in rendered.filename

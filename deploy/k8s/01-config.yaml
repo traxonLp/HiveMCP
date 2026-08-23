@@ -1,0 +1,70 @@
+# Configuration and secrets.
+#
+# Apply the whole directory in order:
+#   kubectl apply -f deploy/k8s/
+#
+# The numeric prefixes exist because `kubectl apply -f <dir>` processes files in
+# lexical order, and the Deployment refers to the ConfigMap, the Secret and both PVCs.
+# Applying it first works — Kubernetes retries — but the pod spends its first minute in
+# CreateContainerConfigError, which reads like a real failure.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hivemcp-config
+  labels:
+    app.kubernetes.io/name: hivemcp
+data:
+  # prod, not dev. In dev the /_debug endpoints are mounted, and they reflect the
+  # request headers — session token included — back to whoever called them.
+  HIVE_ENVIRONMENT: "prod"
+  HIVE_LOG_LEVEL: "INFO"
+
+  # Where browsers reach HiveMCP. Download links are built from this, so it must be the
+  # ingress host rather than the service name: a link containing the cluster-internal
+  # name resolves nowhere from a user's laptop.
+  HIVE_PUBLIC_URL: "https://hivemcp.example.com"
+
+  # Where OpenWebUI is, from inside the cluster. This is the reverse direction of the
+  # above and is correctly a service name.
+  HIVE_OWUI_URL: "http://open-webui.openwebui.svc.cluster.local:8080"
+
+  HIVE_DATA_DIR: "/data"
+  HIVE_TEMPLATES_DIR: "/templates"
+
+  # Bind on all interfaces. The SDK default of 127.0.0.1 turns on DNS rebinding
+  # protection, which rejects the Host header of any request arriving through a Service.
+  HIVE_MCP_HOST: "0.0.0.0"
+
+  HIVE_MAX_UPLOAD_MB: "50"
+  # Renders are CPU-bound and run in worker threads. Keep this at or below the CPU limit
+  # in 02-deployment.yaml, or the pod queues work it has no core to run.
+  HIVE_MAX_RENDER_CONCURRENCY: "4"
+  HIVE_TMP_TTL_MINUTES: "60"
+  HIVE_SESSION_CACHE_TTL_SECONDS: "60"
+
+  # Brief mode: HiveMCP asks OpenWebUI to expand a one-line brief into a spec, using the
+  # model selected in the chat and the caller's own token.
+  HIVE_LLM_ENABLED: "false"
+  HIVE_LLM_TIMEOUT_SECONDS: "120"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hivemcp-secrets
+  labels:
+    app.kubernetes.io/name: hivemcp
+type: Opaque
+stringData:
+  # Signs download links and the iframe tokens. Generate one per environment:
+  #
+  #   kubectl create secret generic hivemcp-secrets \
+  #     --from-literal=HIVE_SIGNING_KEY="$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')"
+  #
+  # It must be set and shared across replicas. Left empty, each pod invents its own at
+  # startup, and a link signed by one pod then fails on every other — which presents as
+  # downloads that work only sometimes, the least pleasant kind of bug to chase.
+  #
+  # Replace this placeholder or, better, delete this Secret from the file and create it
+  # out of band so a real key never lands in git.
+  HIVE_SIGNING_KEY: "CHANGE-ME-generate-a-real-key"

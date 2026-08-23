@@ -43,7 +43,7 @@ HEADER_MODEL = "X-Hive-Model"
 # Endpoints that may validate a session token and return the user. Probed in this order
 # on first use; whichever answers with a usable identity is remembered.
 #
-# Measured against OpenWebUI (spike S2, docs/M0_SPIKES.md):
+# Measured against OpenWebUI during the M0 integration spikes:
 #   /api/v1/auths/      200 in ~13 ms, full identity (id, name, email, role)
 #   /api/v1/users/user  400
 #   /api/v1/auths/user  200 in ~4 ms, but an EMPTY body
@@ -279,19 +279,37 @@ def _identity_from_payload(response: httpx.Response) -> Identity | None:
     )
 
 
-def _context_from_headers(identity: Identity, headers: object) -> Identity:
-    """Attach chat context. These are not credentials, so header trust is fine here."""
+def _header(headers: object, name: str) -> str | None:
+    """Read one header, whatever case it arrived in.
+
+    Starlette's ``Headers`` is already case-insensitive, but this function is also handed
+    plain dicts — by the MCP surface's context shim and by tests — and a dict lookup is
+    not. HTTP/2 and HTTP/3 mandate lowercase field names on the wire, so ``X-Hive-Model``
+    is exactly the spelling that would *not* be found.
+
+    Silently returning None here is expensive: the model name from ``X-Hive-Model`` is
+    what makes brief mode use the model the user picked in the chat, and losing it falls
+    back to a default without saying so.
+    """
     get = getattr(headers, "get", None)
     if get is None:
+        return None
+    value = get(name) or get(name.lower())
+    return value or None
+
+
+def _context_from_headers(identity: Identity, headers: object) -> Identity:
+    """Attach chat context. These are not credentials, so header trust is fine here."""
+    if getattr(headers, "get", None) is None:
         return identity
     return Identity(
         user_id=identity.user_id,
         email=identity.email,
         name=identity.name,
         role=identity.role,
-        chat_id=get(HEADER_CHAT_ID) or None,
-        message_id=get(HEADER_MESSAGE_ID) or None,
-        model=get(HEADER_MODEL) or None,
+        chat_id=_header(headers, HEADER_CHAT_ID),
+        message_id=_header(headers, HEADER_MESSAGE_ID),
+        model=_header(headers, HEADER_MODEL),
     )
 
 

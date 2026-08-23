@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from docx import Document
@@ -70,6 +71,7 @@ class DocxRenderer:
         self._apply_metadata(document, spec)
 
         self._add_front_matter(document, spec)
+        self._add_optional_toc(document, spec)
 
         for index, block in enumerate(spec.blocks):
             handler = getattr(self, f"_block_{block.type}", None)
@@ -169,6 +171,23 @@ class DocxRenderer:
             document.add_paragraph(spec.subtitle, style=subtitle_style)
             self._count(spec.subtitle)
         _ = paragraph
+
+    def _add_optional_toc(self, document: Any, spec: Any) -> None:
+        """Honour ``RenderOptions.include_toc``.
+
+        The option is offered in the configuration GUI, so it has to do something here.
+        It did not: until now ``include_toc`` was read by the GUI, sent to the server and
+        then referenced by nothing at all, which meant ticking the box produced a
+        document without a table of contents and no warning either.
+
+        A ``toc`` block in the spec wins, so a model that placed one deliberately does
+        not end up with two.
+        """
+        if not getattr(self.options, "include_toc", False):
+            return
+        if any(getattr(block, "type", None) == "toc" for block in spec.blocks):
+            return
+        self._block_toc(document, SimpleNamespace(depth=3))
 
     def _count(self, text: str | None) -> None:
         if text:

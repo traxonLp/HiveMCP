@@ -270,11 +270,19 @@ async def test_repair_attempts_are_bounded(llm_settings: Settings) -> None:
     assert calls == 3, "initial attempt plus two repairs"
 
 
-async def test_rejected_api_key_names_the_likely_cause(llm_settings: Settings) -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(401, text="unauthorized")
+@pytest.mark.parametrize("status", [401, 403])
+async def test_a_refused_session_names_the_likely_cause(
+    status: int, llm_settings: Settings
+) -> None:
+    """There is no API key any more — the caller's own session token is the credential.
 
-    with pytest.raises(LlmError, match="allowed to use this model"):
+    So a 401 means their session expired or they cannot reach that model, and the
+    message has to say both rather than pointing at a key that no longer exists.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, text="unauthorized")
+
+    with pytest.raises(LlmError, match="session may have expired"):
         await chat_client(handler).complete("m", [{"role": "user", "content": "hi"}], TOKEN)
 
 

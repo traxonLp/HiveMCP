@@ -157,10 +157,17 @@ class TemplateStore:
 
         template_id = self._free_id(slugify(name))
         directory = self.root / template_id
-        directory.mkdir(parents=True, exist_ok=True)
-
         stored_name = f"template{Path(filename).suffix.lower()}"
-        (directory / stored_name).write_bytes(data)
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / stored_name).write_bytes(data)
+        except OSError as exc:
+            # Almost always a volume the container cannot write to. Saying so beats a
+            # 500, because the fix is in the deployment rather than in the request.
+            raise TemplateError(
+                f"the template store at {self.root} is not writable ({exc}). The volume "
+                "mounted there must be writable by the user the container runs as."
+            ) from exc
 
         meta = TemplateMeta(
             template_id=template_id,

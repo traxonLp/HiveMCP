@@ -1,0 +1,58 @@
+# Scaling and disruption behaviour.
+#
+# Requires the metrics server for the HPA. Without it the HPA reports <unknown> targets
+# and does nothing — harmless, but it will not scale either.
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: hivemcp
+  labels:
+    app.kubernetes.io/name: hivemcp
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: hivemcp
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          # Against the 250m request, not a limit — there is none. Renders are bursty,
+          # so this is set low enough that a queue forms only briefly before more pods
+          # arrive.
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      # Renders are short but arrive in clusters. Scaling down eagerly means the next
+      # burst waits on a cold pod, so this holds capacity for five minutes.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: hivemcp
+  labels:
+    app.kubernetes.io/name: hivemcp
+spec:
+  # Not maxUnavailable: with minReplicas at 2, `maxUnavailable: 1` would let a node
+  # drain take one pod while a scale-down took the other. minAvailable keeps one serving
+  # whatever else is happening.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hivemcp

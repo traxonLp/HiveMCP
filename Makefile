@@ -1,7 +1,7 @@
 COMPOSE := docker compose -f deploy/docker-compose.yml
 
 .DEFAULT_GOAL := help
-.PHONY: help build up down logs smoke shell test lint clean owui env check-secrets
+.PHONY: help build up down logs smoke shell test test-host lint clean owui env check-secrets
 
 help: ## Show this help
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
@@ -21,7 +21,8 @@ check-secrets: ## Fail if anything credential-shaped is tracked by git
 	  echo "$$hits"; echo; echo "Possible API key in a tracked file. Do not commit."; exit 1; \
 	fi
 	@hits=$$(git grep -nIE '^[[:space:]]*(HIVE_(AUTH_TOKEN|SIGNING_KEY|OWUI_API_KEY)|WEBUI_SECRET_KEY)[:=][[:space:]]*[^[:space:]#$$]' \
-	  -- ':!*.example' ':!docs/*' ':!Makefile' ':!deploy/docker-compose.yml' || true); \
+	  -- ':!*.example' ':!docs/*' ':!Makefile' ':!deploy/docker-compose.yml' \
+	  | grep -viE 'CHANGE-?ME|not-for-production|replace-me|your-key-here' || true); \
 	if [ -n "$$hits" ]; then \
 	  echo "$$hits"; echo; echo "Secret assigned in a tracked file. Move it to .env."; exit 1; \
 	fi
@@ -57,7 +58,14 @@ down: ## Stop everything (volumes are kept)
 clean: ## Stop everything and delete the volumes
 	$(COMPOSE) --profile owui down -v
 
-test: ## Run the test suite on the host
+# ARGS is passed through to pytest:  make test ARGS="-k templates -x"
+ARGS ?= -q -rf --tb=short
+
+test: ## Run the test suite in the container (no host Python needed)
+	@DOCKER_BUILDKIT=1 docker build -f deploy/Dockerfile --target test -t hivemcp-test:local .
+	@docker run --rm hivemcp-test:local $(ARGS)
+
+test-host: ## Run the test suite on the host (needs `pip install -e .[dev]`)
 	pytest -q
 
 lint: ## Lint and type-check on the host

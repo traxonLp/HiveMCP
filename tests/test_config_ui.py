@@ -19,7 +19,7 @@ from hivemcp.config import Settings
 from hivemcp.core.models import DeckSpec, RenderOptions, Slide
 from hivemcp.core.preferences import UserPreferences, parse_preferences
 from hivemcp.core.render.pptx import render_presentation
-from hivemcp.surfaces.config_ui import js_literal, render_config_page
+from hivemcp.surfaces.config_ui import dark_css, js_literal, render_config_page
 
 TEMPLATES = [
     {
@@ -146,16 +146,31 @@ def test_the_background_is_transparent() -> None:
 
 
 def test_a_known_dark_instance_is_dark_regardless_of_the_operating_system() -> None:
-    html = render_config_page("pptx", TEMPLATES, preferences=UserPreferences(theme="dark"))
+    """A known theme is pinned, so the OS never gets a vote.
 
-    assert ":root { color-scheme: dark" in html
-    assert "prefers-color-scheme" not in html
+    Asserted against the generated rule from ``dark_css`` rather than against a substring
+    of the whole page: the words "prefers-color-scheme" and "getComputedStyle" both
+    appear in explanatory comments in the stylesheet and the script, so a naive
+    ``not in html`` matches the prose and fails on correct output.
+    """
+    rules = dark_css("dark")
+
+    assert "color-scheme: dark" in rules
+    assert "@media" not in rules, "a known theme must not depend on a media query"
 
 
-def test_a_known_light_instance_has_no_dark_rules_at_all() -> None:
-    html = render_config_page("pptx", TEMPLATES, preferences=UserPreferences(theme="light"))
+def test_a_known_light_instance_never_turns_dark_on_its_own() -> None:
+    """Light stays light unless the user asks in the card.
 
-    assert "color-scheme: dark" not in html
+    The dark variables are still emitted, but only behind ``[data-theme="dark"]`` — that
+    is what keeps the manual toggle working on a light instance. What must not survive is
+    any rule that could fire without that attribute.
+    """
+    rules = dark_css("light")
+
+    assert "@media" not in rules
+    assert '[data-theme="dark"]' in rules
+    assert ':not([data-theme="light"])' not in rules
 
 
 def test_the_card_accepts_both_schemes_so_the_embedder_decides() -> None:
@@ -186,10 +201,13 @@ def test_the_toggle_reads_the_media_query_not_the_declaration() -> None:
     """With `color-scheme: light dark` the computed value is the declaration itself, not
     the scheme in use, so getComputedStyle would report 'light dark' and never flip."""
     script = SCRIPT_BLOCK.search(render_config_page("pptx", TEMPLATES)).group(1)
+    code = "\n".join(
+        line for line in script.splitlines() if not line.lstrip().startswith("//")
+    )
 
-    assert "matchMedia('(prefers-color-scheme: dark)')" in script
-    assert "getComputedStyle" not in script
-    assert "root.style.colorScheme" in script, "an override must pin the scheme"
+    assert "matchMedia('(prefers-color-scheme: dark)')" in code
+    assert "getComputedStyle" not in code
+    assert "root.style.colorScheme" in code, "an override must pin the scheme"
 
 
 def test_an_explicit_theme_beats_the_stored_preference() -> None:
@@ -197,7 +215,8 @@ def test_an_explicit_theme_beats_the_stored_preference() -> None:
         "pptx", TEMPLATES, preferences=UserPreferences(theme="light"), theme="dark"
     )
 
-    assert ":root { color-scheme: dark" in html
+    assert dark_css("dark") in html
+    assert dark_css("light") not in html
 
 
 @pytest.mark.parametrize(
@@ -401,7 +420,7 @@ def test_open_config_follows_the_users_openwebui_settings(client: TestClient) ->
 
     html = client.get("/tools/open_config?kind=pptx", headers=SESSION).text
 
-    assert ":root { color-scheme: dark" in html
+    assert dark_css("dark") in html
     assert 'lang="de"' in html
 
 
@@ -422,14 +441,21 @@ def test_open_config_still_renders_when_settings_cannot_be_read(
     assert "@media (prefers-color-scheme: dark)" in response.text
 
 
-def test_open_config_lists_the_callers_own_templates(client: TestClient) -> None:
+def test_open_config_lists_the_shared_templates(client: TestClient) -> None:
     """The form is built by an authenticated call, so it can show real templates rather
-    than a free-text field the user has to guess into."""
+    than a free-text field the user has to guess into.
+
+    The pool is shared and admin-curated: an ordinary user sees every template but put
+    none of them there, so the fixture has to write as an administrator.
+    """
     deck = render_presentation(
         DeckSpec(title="T", slides=[Slide(title="X")]), RenderOptions()
     ).data
     client.app.state.templates.store.put(
-        deck, name="Meine Vorlage", filename="a.pptx", identity=Identity(user_id="u-1")
+        deck,
+        name="Meine Vorlage",
+        filename="a.pptx",
+        identity=Identity(user_id="admin-1", role="admin"),
     )
 
     html = client.get("/tools/open_config?kind=pptx", headers=SESSION).text

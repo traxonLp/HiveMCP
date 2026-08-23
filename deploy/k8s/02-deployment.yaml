@@ -1,0 +1,113 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hivemcp
+  labels:
+    app.kubernetes.io/name: hivemcp
+    app.kubernetes.io/version: "1.0.0"
+spec:
+  replicas: 2
+  # Both volumes are ReadWriteMany and the MCP surface runs stateless_http, so several
+  # pods can serve the same user's session without affinity at the ingress. If your
+  # storage class only offers ReadWriteOnce, set replicas to 1 and remove the HPA.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hivemcp
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hivemcp
+      annotations:
+        # Restarts the pods when the config changes. Without this a `kubectl apply` that
+        # only touches the ConfigMap leaves every running pod on the old values, which
+        # looks like the change was ignored.
+        checksum/config: "replace-me-or-roll-manually"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        # Matches the image's uid, so both PVCs are writable without root.
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: hivemcp
+          # Rewritten by .github/workflows/release.yml on every release.
+          image: ghcr.io/traxonlp/hivemcp:1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: hivemcp-config
+            - secretRef:
+                name: hivemcp-secrets
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              # No CPU limit on purpose: rendering is bursty and CPU-bound, and a limit
+              # here means CFS throttling mid-render — a slow document rather than a
+              # rejected one, which is harder to diagnose. The memory limit stays,
+              # because a runaway render should be killed rather than take the node.
+              memory: "1Gi"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 5
+          readinessProbe:
+            # Checks that both volumes are writable, so a pod with a broken mount is
+            # taken out of the Service instead of failing every render it receives.
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          startupProbe:
+            # Generous, so a slow first mount does not trip the liveness probe into a
+            # restart loop before the process has finished starting.
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 24
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: templates
+              mountPath: /templates
+            # readOnlyRootFilesystem is on, so anything that writes outside the PVCs
+            # needs a volume. python-pptx and openpyxl both use tempfile while saving.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: hivemcp-data
+        - name: templates
+          persistentVolumeClaim:
+            claimName: hivemcp-templates
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 256Mi
+      # Long enough for an in-flight render to finish rather than be cut off mid-request.
+      terminationGracePeriodSeconds: 60

@@ -1,6 +1,6 @@
 """Diagnostics for the M0 spikes. Dev only.
 
-Answers the questions in docs/M0_SPIKES.md by showing what actually arrives on the wire:
+Answers the M0 integration questions by showing what actually arrives on the wire:
 which headers OpenWebUI sends, whether a session token is among them, whether that token
 validates, and who it belongs to.
 
@@ -125,7 +125,7 @@ async def whoami(request: Request) -> JSONResponse:
     Call this to diagnose the HiveMCP connection. Show the user the full JSON result;
     credentials in it are already masked.
 
-    (Spikes S1, S2 and S4 of docs/M0_SPIKES.md in one response.)
+    (Spikes S1, S2 and S4 in one response.)
     """
     settings: Settings = request.app.state.settings
 
@@ -136,7 +136,7 @@ async def whoami(request: Request) -> JSONResponse:
 
     token, source = _extract_token(request)
     report: dict[str, Any] = {
-        "spike": "S1/S2/S4 - see docs/M0_SPIKES.md",
+        "spike": "S1/S2/S4",
         "client": request.client.host if request.client else None,
         "headers": dict(sorted(headers.items())),
         "hive_identity_headers": {
@@ -240,7 +240,7 @@ async def upload_check(request: Request) -> JSONResponse:
 
     Show the user the full JSON result.
 
-    (Spike S3 of docs/M0_SPIKES.md. Whether the file *appears* in a file list is weak
+    (Spike S3. Whether the file *appears* in a file list is weak
     evidence — an admin may see everything. The owner id recorded on the file is the
     decisive answer.)
     """
@@ -254,7 +254,7 @@ async def upload_check(request: Request) -> JSONResponse:
 
     payload = b"HiveMCP ownership probe\n"
     report: dict[str, Any] = {
-        "spike": "S3 - see docs/M0_SPIKES.md",
+        "spike": "S3",
         "authenticated_as": caller.identity.audit_dict(),
     }
 
@@ -332,7 +332,7 @@ async def upload_check(request: Request) -> JSONResponse:
 async def richui() -> HTMLResponse:
     """Render a small test card inline in the chat to verify iframe embedding works.
 
-    (Spike S7 of docs/M0_SPIKES.md. If OpenWebUI shows a card rather than printing HTML,
+    (Spike S7. If OpenWebUI shows a card rather than printing HTML,
     the path milestone M5 depends on works.)
     """
     html = """<!DOCTYPE html>

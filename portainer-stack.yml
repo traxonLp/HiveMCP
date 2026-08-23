@@ -1,0 +1,119 @@
+# Portainer stack (Git repository method).
+#
+# In Portainer: Stacks -> Add stack -> Repository
+#   Repository URL       your HiveMCP repo
+#   Compose path         portainer-stack.yml
+#   Environment variables  see the table in deploy/PORTAINER.md
+#
+# Differs from docker-compose.yml in four ways, each because Portainer works differently
+# from a local checkout:
+#
+#   1. It pulls a published image instead of building one. CI builds and pushes to GHCR
+#      on every push to main. That also removes the failure this file was first written
+#      around: with no `build.context`, there is no path for Portainer to mis-resolve.
+#   2. No `env_file`. ../.env is gitignored, so it does not exist in the cloned
+#      repository. Configuration comes from Portainer's own environment variables, which
+#      are substituted into ${...} below.
+#   3. Everything is a ${VARIABLE}, not a literal. A value written directly into
+#      `environment:` cannot be changed from the Portainer UI without editing the file
+#      and redeploying — the same precedence trap documented in docker-compose.yml.
+#   4. It joins OpenWebUI's existing network as `external`. Two stacks do not share a
+#      network by default, and without this the service name never resolves: HiveMCP
+#      cannot validate a single session token and every call fails authentication.
+#
+# The image is public, so no registry login is needed. If you make the package private
+# in GitHub, add a registry credential for ghcr.io in Portainer first.
+
+name: hivemcp
+
+services:
+  hivemcp:
+    # Pulled, not built. GitHub Actions builds and publishes on every push to main, so
+    # there is nothing for the Docker host to compile — which also means no build
+    # context, and with it the whole class of path problem that made the first attempts
+    # at this file fail.
+    #
+    # Pin HIVEMCP_TAG to a version (1.0.7) once you care about which one is running.
+    # `latest` is convenient and is exactly what you cannot roll back from.
+    image: ghcr.io/traxonlp/hivemcp:${HIVEMCP_TAG:-latest}
+    # Portainer's "Pull and redeploy" honours this and fetches a newer :latest.
+    pull_policy: always
+    ports:
+      - "${HIVE_PORT:-8080}:8080"
+    environment:
+      # --- must be set ------------------------------------------------------
+      # Where OpenWebUI is, from inside Docker. Service name and internal port of the
+      # OpenWebUI container, NOT the published host port:
+      #   http://open-webui:8080
+      # Check the actual service name in Portainer -> Containers; it is often
+      # `open-webui` but the stack author chose it.
+      HIVE_OWUI_URL: ${HIVE_OWUI_URL:?set this to your OpenWebUI service URL}
+
+      # Signs download links and iframe tokens. Generate once and keep it:
+      #   python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+      # Unset, a fresh key is invented at every start and every link handed out before
+      # the restart stops working.
+      HIVE_SIGNING_KEY: ${HIVE_SIGNING_KEY:?generate a signing key}
+
+      # Where a browser reaches HiveMCP. Download links are built from this, so it must
+      # be an address the user's machine can open — the Docker host's name or IP, or the
+      # public URL if a reverse proxy sits in front. Not localhost, unless you only ever
+      # use this from the Docker host itself.
+      HIVE_PUBLIC_URL: ${HIVE_PUBLIC_URL:?set this to the URL users reach HiveMCP at}
+
+      # --- sensible defaults ------------------------------------------------
+      # prod keeps the /_debug endpoints unmounted. They reflect request headers,
+      # session token included, back to whoever calls them. Set dev only while
+      # diagnosing something, and set it back.
+      HIVE_ENVIRONMENT: ${HIVE_ENVIRONMENT:-prod}
+      HIVE_LOG_LEVEL: ${HIVE_LOG_LEVEL:-INFO}
+
+      # Brief mode: HiveMCP asks OpenWebUI to expand a one-line brief into a spec, using
+      # the model selected in the chat and the caller's own token.
+      HIVE_LLM_ENABLED: ${HIVE_LLM_ENABLED:-false}
+
+      HIVE_MAX_UPLOAD_MB: ${HIVE_MAX_UPLOAD_MB:-50}
+      HIVE_MAX_RENDER_CONCURRENCY: ${HIVE_MAX_RENDER_CONCURRENCY:-4}
+      HIVE_TMP_TTL_MINUTES: ${HIVE_TMP_TTL_MINUTES:-60}
+
+      # --- fixed: tied to the volume mounts below ---------------------------
+      HIVE_DATA_DIR: /data
+      HIVE_TEMPLATES_DIR: /templates
+      # The SDK default of 127.0.0.1 turns on DNS rebinding protection, which rejects
+      # requests arriving as `Host: hivemcp:8080` from another container.
+      HIVE_MCP_HOST: 0.0.0.0
+    networks:
+      - default
+      - openwebui
+    volumes:
+      # Named volumes, not bind mounts: the container runs as uid 10001, and a host
+      # directory would arrive owned by root or by you, so every write would fail.
+      - hivemcp-data:/data
+      - hivemcp-templates:/templates
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=4).status==200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+networks:
+  default:
+  openwebui:
+    external: true
+    # The network your OpenWebUI stack already created. Portainer names it
+    # <stackname>_<networkname>, so a stack called "openwebui" with no explicit network
+    # gives "openwebui_default". Look it up under Networks in Portainer and set
+    # OWUI_NETWORK to exactly that string — a wrong name fails the deploy immediately
+    # with "network not found", which is the good case; the bad case is guessing a name
+    # that exists but is the wrong one.
+    name: ${OWUI_NETWORK:?set this to your OpenWebUI stack's network name}
+
+volumes:
+  hivemcp-data:
+  hivemcp-templates:

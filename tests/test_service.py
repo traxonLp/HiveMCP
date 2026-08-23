@@ -20,6 +20,8 @@ from hivemcp.core.models import (
 )
 from hivemcp.core.render.base import RenderError
 from hivemcp.core.service import DocumentService, ToolError
+from hivemcp.core.templates.service import TemplateService
+from hivemcp.core.templates.store import TemplateStore
 
 
 def a_caller(user_id: str = "u-1") -> Caller:
@@ -118,12 +120,33 @@ async def test_brief_without_llm_tells_the_model_to_build_the_spec(
         await service.create_presentation(caller, brief="10 slides about pricing")
 
 
-async def test_template_id_is_rejected_with_a_pointer_to_the_milestone(
+async def test_template_id_without_a_template_service_says_so(
     service: DocumentService, caller: Caller, deck: DeckSpec
 ) -> None:
-    with pytest.raises(ToolError, match="M4"):
+    """A server built without template support must say that, not fail obscurely.
+
+    The message also has to give the model a way forward — dropping ``template_id`` —
+    or it retries the same call.
+    """
+    with pytest.raises(ToolError, match="Omit 'template_id'"):
         await service.create_presentation(
             caller, spec=deck, options=RenderOptions(template_id="corp")
+        )
+
+
+async def test_an_unknown_template_id_reports_the_stores_own_message(
+    settings: Settings, delivery: RecordingDelivery, caller: Caller, deck: DeckSpec
+) -> None:
+    settings.ensure_dirs()
+    service = DocumentService(
+        settings,
+        delivery,
+        FakeOwui(),
+        templates=TemplateService(settings, TemplateStore(settings.templates_dir), FakeOwui()),
+    )
+    with pytest.raises(ToolError, match="hive_list_templates"):
+        await service.create_presentation(
+            caller, spec=deck, options=RenderOptions(template_id="gibt-es-nicht")
         )
 
 
@@ -196,25 +219,35 @@ async def test_concurrency_is_bounded_by_the_semaphore(
         settings.model_copy(update={"max_render_concurrency": 2}), delivery, FakeOwui()
     )
 
-    peak = 0
-    live = 0
-    original = service._render  # noqa: SLF001
+    # Counted *inside* the semaphore, by wrapping the semaphore itself. Wrapping
+    # `_render` instead — the obvious move — measures how many coroutines have entered
+    # the method, and they all enter before any of them blocks on acquire. That reads as
+    # a peak of 6 no matter how small the limit is, so it would fail against correct code
+    # and, worse, pass against code with no semaphore at all.
+    class Counting:
+        def __init__(self, inner: asyncio.Semaphore) -> None:
+            self.inner = inner
+            self.live = 0
+            self.peak = 0
 
-    async def counting(*args, **kwargs):  # noqa: ANN001, ANN202
-        nonlocal peak, live
-        live += 1
-        peak = max(peak, live)
-        try:
-            return await original(*args, **kwargs)
-        finally:
-            live -= 1
+        async def __aenter__(self) -> None:
+            await self.inner.acquire()
+            self.live += 1
+            self.peak = max(self.peak, self.live)
 
-    service._render = counting  # noqa: SLF001
+        async def __aexit__(self, *exc: object) -> None:
+            self.live -= 1
+            self.inner.release()
+
+    counting = Counting(service._semaphore)  # noqa: SLF001
+    service._semaphore = counting  # noqa: SLF001
+
     await asyncio.gather(
         *(service.create_presentation(a_caller(f"u-{i}"), spec=deck) for i in range(6))
     )
 
-    assert peak <= 2, f"expected at most 2 concurrent renders, saw {peak}"
+    assert counting.peak <= 2, f"expected at most 2 concurrent renders, saw {counting.peak}"
+    assert counting.peak > 0, "the semaphore was never entered, so nothing was measured"
 
 
 async def test_spreadsheet_reports_sheet_names(

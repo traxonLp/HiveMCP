@@ -1,0 +1,52 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: hivemcp
+  labels:
+    app.kubernetes.io/name: hivemcp
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: hivemcp
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hivemcp
+  labels:
+    app.kubernetes.io/name: hivemcp
+  annotations:
+    # A spec carrying an inline base64 image is large, and base64 inflates by 4/3. The
+    # nginx default of 1m rejects those with a 413 that never reaches the application,
+    # so the model sees a transport error rather than a message it can act on.
+    nginx.ingress.kubernetes.io/proxy-body-size: "64m"
+    # Brief mode waits on a completion from OpenWebUI, which can take a while on a large
+    # document. Shorter than HIVE_LLM_TIMEOUT_SECONDS and the ingress gives up first,
+    # turning a slow render into a 504.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "180"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "180"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - hivemcp.example.com
+      secretName: hivemcp-tls
+  rules:
+    # Must match HIVE_PUBLIC_URL in the ConfigMap. They are two halves of one setting:
+    # this is where requests arrive, that is what download links are built from, and a
+    # mismatch produces links that resolve nowhere.
+    - host: hivemcp.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: hivemcp
+                port:
+                  name: http
