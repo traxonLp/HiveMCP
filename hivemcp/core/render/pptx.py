@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from pptx import Presentation
-from pptx.chart.data import CategoryChartData
+from pptx.chart.data import CategoryChartData, XyChartData
 from pptx.enum.chart import XL_CHART_TYPE
 from pptx.dml.color import RGBColor
 from pptx.util import Cm, Pt
@@ -298,13 +298,50 @@ class PptxRenderer:
             for index, width_cm in enumerate(data.column_widths_cm):
                 table.columns[index].width = Cm(width_cm)
 
+    @staticmethod
+    def _chart_data_for(data: Any) -> Any:
+        """Build the chart-data object the chart type actually requires.
+
+        Scatter is not a category chart and needs ``XyChartData``. Handing it a
+        ``CategoryChartData`` used to raise deep inside python-pptx: the scatter XML
+        writer reads ``series.x_values``, which collects ``dp.x`` from each data point,
+        and a ``CategoryDataPoint`` only carries ``.value``. So every ``chart_type:
+        "scatter"`` failed with an AttributeError from a library internal — an error that
+        said nothing about the spec that caused it.
+
+        The mapping is the natural one: the category labels are the X values, each
+        series' values are the Y values.
+        """
+        if data.chart_type != "scatter":
+            chart_data = CategoryChartData()
+            chart_data.categories = data.categories
+            for series in data.series:
+                chart_data.add_series(series.name, series.values)
+            return chart_data
+
+        try:
+            x_values = [float(category) for category in data.categories]
+        except (TypeError, ValueError) as exc:
+            # A scatter plot needs a numeric X axis. Labels like "Q1" have no position
+            # on one, so this is a spec problem the model can fix by choosing the chart
+            # type it almost certainly meant.
+            raise RenderError(
+                "a scatter chart needs numeric categories to use as X values, but "
+                f"{data.categories[:4]!r} are labels. Use chart_type 'line' or 'column' "
+                "for labelled categories, or pass numbers as the categories."
+            ) from exc
+
+        chart_data = XyChartData()
+        for series in data.series:
+            xy_series = chart_data.add_series(series.name)
+            for x_value, y_value in zip(x_values, series.values):
+                xy_series.add_data_point(x_value, y_value)
+        return chart_data
+
     def _add_chart(
         self, prs: Presentation, slide: Any, data: Any, top_cm: float = 4.0
     ) -> None:
-        chart_data = CategoryChartData()
-        chart_data.categories = data.categories
-        for series in data.series:
-            chart_data.add_series(series.name, series.values)
+        chart_data = self._chart_data_for(data)
 
         graphic_frame = slide.shapes.add_chart(
             CHART_TYPES[data.chart_type],

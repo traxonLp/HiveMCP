@@ -135,6 +135,78 @@ def test_chart_slide_produces_a_real_chart(options: RenderOptions) -> None:
     assert [s.name for s in charts[0].plots[0].series] == ["2026"]
 
 
+def test_scatter_charts_render(options: RenderOptions) -> None:
+    """Scatter needs XyChartData, not CategoryChartData.
+
+    Fed the wrong one, python-pptx raised from inside its scatter XML writer — every
+    chart_type 'scatter' failed with an AttributeError about a library internal.
+    """
+    spec = DeckSpec(
+        title="T",
+        slides=[
+            Slide(
+                layout="chart",
+                title="Streuung",
+                chart=ChartData(
+                    chart_type="scatter",
+                    categories=["1", "2", "3"],
+                    series=[ChartSeries(name="Messung", values=[2.0, 4.0, 8.0])],
+                ),
+            )
+        ],
+    )
+    slide = opened(render_presentation(spec, options)).slides[0]
+    charts = [shape.chart for shape in slide.shapes if shape.has_chart]
+    assert len(charts) == 1
+
+
+def test_scatter_with_labelled_categories_explains_itself(
+    options: RenderOptions,
+) -> None:
+    """A scatter plot has no place to put "Q1" on a numeric axis.
+
+    The message names the chart type the caller almost certainly meant, because a bare
+    validation error here just gets retried unchanged.
+    """
+    spec = DeckSpec(
+        title="T",
+        slides=[
+            Slide(
+                layout="chart",
+                chart=ChartData(
+                    chart_type="scatter",
+                    categories=["Q1", "Q2"],
+                    series=[ChartSeries(name="Umsatz", values=[1.0, 2.0])],
+                ),
+            )
+        ],
+    )
+    with pytest.raises(RenderError) as caught:
+        render_presentation(spec, options)
+    assert "line" in str(caught.value)
+
+
+@pytest.mark.parametrize("chart_type", ["bar", "column", "line", "pie", "area"])
+def test_every_category_chart_type_renders(
+    chart_type: str, options: RenderOptions
+) -> None:
+    spec = DeckSpec(
+        title="T",
+        slides=[
+            Slide(
+                layout="chart",
+                chart=ChartData(
+                    chart_type=chart_type,
+                    categories=["A", "B"],
+                    series=[ChartSeries(name="S", values=[1.0, 2.0])],
+                ),
+            )
+        ],
+    )
+    slide = opened(render_presentation(spec, options)).slides[0]
+    assert any(shape.has_chart for shape in slide.shapes)
+
+
 def test_inline_image_is_embedded(tiny_png: str, options: RenderOptions) -> None:
     spec = DeckSpec(
         title="T",

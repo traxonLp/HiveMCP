@@ -81,13 +81,15 @@ def test_frontmatter_is_stripped_from_the_body(registry: SkillRegistry) -> None:
 
 
 # Real tools the guide deliberately stays quiet about.
+#
+# This set used to also hold hive_open_config and hive_show_download, on the reasoning
+# that a model calling them "gets an HTML card it cannot use". That was backwards: the
+# card is for the user, and OpenWebUI renders it. Leaving them out meant the settings
+# form only ever appeared when a user happened to ask for "Einstellungen" by name, and
+# nothing ever told the model it could offer one.
 UNDOCUMENTED_ON_PURPOSE = {
     # Describing itself to a model already reading it would be circular.
     "hive_usage_guide",
-    # Rich UI surfaces. OpenWebUI invokes these; a model calling them directly gets an
-    # HTML card it cannot use, so pointing at them would invite exactly that.
-    "hive_open_config",
-    "hive_show_download",
 }
 
 
