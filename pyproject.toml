@@ -1,6 +1,6 @@
 [project]
 name = "hivemcp"
-version = "1.0.0"
+version = "1.0.1"
 description = "MCP + OpenAPI server for PowerPoint, Word and Excel generation in OpenWebUI"
 readme = "README.md"
 requires-python = ">=3.11"

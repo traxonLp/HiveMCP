@@ -4,7 +4,7 @@ metadata:
   name: hivemcp
   labels:
     app.kubernetes.io/name: hivemcp
-    app.kubernetes.io/version: "1.0.0"
+    app.kubernetes.io/version: "1.0.1"
 spec:
   replicas: 2
   # Both volumes are ReadWriteMany and the MCP surface runs stateless_http, so several
@@ -39,7 +39,7 @@ spec:
       containers:
         - name: hivemcp
           # Rewritten by .github/workflows/release.yml on every release.
-          image: ghcr.io/traxonlp/hivemcp:1.0.0
+          image: ghcr.io/traxonlp/hivemcp:1.0.1
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
