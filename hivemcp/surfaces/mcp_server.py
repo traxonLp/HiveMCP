@@ -73,19 +73,37 @@ async def _caller_from_context(validator: SessionValidator, ctx: Context | None)
         request = ctx.request_context.request  # type: ignore[union-attr]
         headers = request.headers  # type: ignore[union-attr]
     except Exception as exc:  # noqa: BLE001
-        raise ValueError(
+        raise AuthError(
             "This tool needs an OpenWebUI chat session, and no HTTP request context was "
             "available on this call."
         ) from exc
-    try:
-        return await authenticate(validator, headers)
-    except AuthError as exc:
-        raise ValueError(str(exc)) from exc
+    return await authenticate(validator, headers)
 
 
-def _fail(exc: Exception) -> Exception:
-    """Turn an internal error into one the model can act on."""
-    return ValueError(str(exc))
+# Errors the tools below turn into a readable result. Everything else is a bug here and
+# should surface as one rather than being dressed up as advice to the model.
+TOOL_ERRORS = (AuthError, ToolError, RenderError, TemplateError, SkillError)
+
+
+def _error(exc: Exception) -> dict[str, Any]:
+    """Report a failure as tool *output* rather than by raising.
+
+    Raising loses the message. MCP SDK v2 wraps anything that escapes a tool body in
+    ``UnexpectedToolError``, and the version this pins builds that from the tool name
+    alone — so "operation 3: this document has 12 paragraphs, so there is no paragraph
+    40" reaches the model as "Error executing tool hive_edit_document". Every actionable
+    sentence in this codebase was flattened to that on the MCP surface.
+
+    Later SDK builds append the original message, so this could become unnecessary. It
+    is kept because it does not depend on which build is installed, and because the
+    alternative that also survives — raising ``MCPError`` to force a protocol-level
+    error — changes the response shape in a way clients handle inconsistently, and a
+    protocol error a client swallows is worse than no error at all.
+
+    ``isError`` is not set: the model reads the text either way, and the point is that it
+    can read it.
+    """
+    return {"error": str(exc), "ok": False}
 
 
 def _register_skills(mcp: MCPServer, skills: SkillRegistry) -> None:
@@ -131,12 +149,12 @@ def _register_skills(mcp: MCPServer, skills: SkillRegistry) -> None:
         if name is None:
             skill = skills.default
             if skill is None:
-                raise ValueError("this server ships no usage guide")
+                return _error(SkillError("this server ships no usage guide"))
         else:
             try:
                 skill = skills.get(name)
-            except SkillError as exc:
-                raise _fail(exc) from exc
+            except TOOL_ERRORS as exc:
+                return _error(exc)
         return {"available": skills.names(), **skill.to_dict()}
 
 
@@ -171,8 +189,8 @@ def build_mcp_server(
             result = await service.create_presentation(
                 caller, options=options, spec=spec, brief=brief
             )
-        except (ToolError, RenderError) as exc:
-            raise _fail(exc) from exc
+        except TOOL_ERRORS as exc:
+            return _error(exc)
         return result.model_dump(exclude_none=True)
 
     @mcp.tool(
@@ -195,8 +213,8 @@ def build_mcp_server(
             result = await service.create_document(
                 caller, options=options, spec=spec, brief=brief
             )
-        except (ToolError, RenderError) as exc:
-            raise _fail(exc) from exc
+        except TOOL_ERRORS as exc:
+            return _error(exc)
         return result.model_dump(exclude_none=True)
 
     @mcp.tool(
@@ -218,8 +236,8 @@ def build_mcp_server(
             result = await service.create_spreadsheet(
                 caller, options=options, spec=spec, brief=brief
             )
-        except (ToolError, RenderError) as exc:
-            raise _fail(exc) from exc
+        except TOOL_ERRORS as exc:
+            return _error(exc)
         return result.model_dump(exclude_none=True)
 
     @mcp.tool(
@@ -234,11 +252,11 @@ def build_mcp_server(
     async def read_document(
         file_id: str, mode: ReadMode = "outline", ctx: Context | None = None
     ) -> dict[str, Any]:
-        caller = await _caller_from_context(validator, ctx)
         try:
+            caller = await _caller_from_context(validator, ctx)
             return await service.read_document(caller, file_id, mode)
-        except ToolError as exc:
-            raise _fail(exc) from exc
+        except TOOL_ERRORS as exc:
+            return _error(exc)
 
     @mcp.tool(
         name="hive_edit_document",
@@ -255,11 +273,11 @@ def build_mcp_server(
         filename: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        caller = await _caller_from_context(validator, ctx)
         try:
+            caller = await _caller_from_context(validator, ctx)
             result = await service.edit_document(caller, file_id, operations, filename)
-        except ToolError as exc:
-            raise _fail(exc) from exc
+        except TOOL_ERRORS as exc:
+            return _error(exc)
         return result.model_dump(exclude_none=True)
 
     @mcp.tool(
@@ -272,8 +290,11 @@ def build_mcp_server(
     async def list_templates(
         kind: TemplateKind | None = None, ctx: Context | None = None
     ) -> dict[str, Any]:
-        caller = await _caller_from_context(validator, ctx)
-        return {"templates": templates.list(caller, kind)}
+        try:
+            caller = await _caller_from_context(validator, ctx)
+            return {"templates": templates.list(caller, kind)}
+        except TOOL_ERRORS as exc:
+            return _error(exc)
 
     @mcp.tool(
         name="hive_inspect_template",
@@ -286,11 +307,11 @@ def build_mcp_server(
     async def inspect_template(
         template_id: str, ctx: Context | None = None
     ) -> dict[str, Any]:
-        caller = await _caller_from_context(validator, ctx)
         try:
+            caller = await _caller_from_context(validator, ctx)
             return templates.inspect(caller, template_id)
-        except TemplateError as exc:
-            raise _fail(exc) from exc
+        except TOOL_ERRORS as exc:
+            return _error(exc)
 
     @mcp.tool(
         name="hive_upload_template",
@@ -307,8 +328,8 @@ def build_mcp_server(
         description: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
-        caller = await _caller_from_context(validator, ctx)
         try:
+            caller = await _caller_from_context(validator, ctx)
             return await templates.upload_from_chat(
                 caller,
                 file_id=file_id,
@@ -316,8 +337,8 @@ def build_mcp_server(
                 filename=filename,
                 description=description,
             )
-        except TemplateError as exc:
-            raise _fail(exc) from exc
+        except TOOL_ERRORS as exc:
+            return _error(exc)
 
     @mcp.tool(
         name="hive_delete_template",
@@ -326,11 +347,11 @@ def build_mcp_server(
     async def delete_template(
         template_id: str, ctx: Context | None = None
     ) -> dict[str, Any]:
-        caller = await _caller_from_context(validator, ctx)
         try:
+            caller = await _caller_from_context(validator, ctx)
             templates.delete(caller, template_id)
-        except TemplateError as exc:
-            raise _fail(exc) from exc
+        except TOOL_ERRORS as exc:
+            return _error(exc)
         return {"deleted": template_id}
 
     _register_skills(mcp, skills or SkillRegistry())

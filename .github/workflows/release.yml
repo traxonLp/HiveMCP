@@ -16,11 +16,14 @@ name: release
 on:
   push:
     branches: [main]
-    paths-ignore:
-      # Documentation alone does not justify a new image.
-      - "**.md"
-      - "docs/**"
-      - ".gitignore"
+    # No paths-ignore. There was one — skipping the build for documentation-only
+    # commits — and a push that plainly contained Python and YAML changes produced no
+    # run at all, while a manual dispatch of the same workflow worked. That narrowed the
+    # cause to the only filter on this trigger, and a release pipeline that silently does
+    # not fire is far more expensive than the occasional pointless build.
+    #
+    # If it turns out the filter was innocent, this is cheap to put back. Do not do so
+    # without reproducing the skip first.
   workflow_dispatch:
 
 # A release that is half-done is worse than one that is late: cancelling between the

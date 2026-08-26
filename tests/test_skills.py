@@ -226,6 +226,24 @@ async def test_getting_the_prompt_returns_the_guide_body(settings: Settings) -> 
 # --------------------------------------------------------------------------- #
 
 
+async def test_a_tool_error_reaches_the_model_with_its_message(
+    settings: Settings,
+) -> None:
+    """The whole point of writing actionable error messages.
+
+    Raising out of an MCP tool body loses them: the SDK replaces whatever was raised
+    with UnexpectedToolError built from the tool name. Every "call hive_list_templates
+    to see what exists" became "Error executing tool hive_inspect_template".
+    """
+    app = create_app(settings)
+    with TestClient(app):
+        result = await app.state.mcp.call_tool("hive_usage_guide", {"name": "nope"})
+
+    text = str(result)
+    assert "nope" in text
+    assert DEFAULT_SKILL in text, "the message should still list what does exist"
+
+
 async def test_the_usage_guide_tool_is_registered(settings: Settings) -> None:
     app = create_app(settings)
     with TestClient(app):

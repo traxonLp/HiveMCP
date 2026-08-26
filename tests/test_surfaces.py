@@ -280,5 +280,10 @@ def test_mcp_tool_call_without_a_session_is_refused(client: TestClient) -> None:
         },
     )
 
+    # The message must survive, not just the failure. MCP SDK v2 wraps anything raised
+    # out of a tool body in UnexpectedToolError built from the tool name alone, so
+    # raising here would reach the model as "Error executing tool
+    # hive_create_presentation" — true, useless, and unactionable. The tools return the
+    # error as output instead; see _error in mcp_server.
     assert "session" in response.text.lower(), response.text[:400]
     assert "Test.pptx" not in response.text, "must not have rendered anything"
