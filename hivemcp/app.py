@@ -63,14 +63,37 @@ async def _sweep_loop(store: ArtifactStore) -> None:
 
 
 def _build_delivery(settings: Settings, store: ArtifactStore, owui: OwuiFilesClient):  # noqa: ANN202
-    """Choose how finished documents reach the user.
+    """Choose how finished documents reach the user. See Settings.delivery_mode.
 
-    The upload runs with the caller's own session token, so the file lands in their file
-    list. A signed link is attached as well, so the model has a URL for its reply and a
-    failed upload still yields the document.
+    Without OpenWebUI configured there is only one option, whatever the mode says: the
+    upload has nowhere to go. Failing here instead would take the whole server down over
+    a setting that only matters once a document exists.
     """
     signed = SignedUrlDelivery(settings, store)
     if not owui.configured:
+        if settings.delivery_mode == "owui":
+            logger.warning(
+                "HIVE_DELIVERY_MODE=owui needs HIVE_OWUI_URL; falling back to signed "
+                "links. Nothing will be added to anyone's OpenWebUI file list."
+            )
+        return signed
+
+    if settings.delivery_mode == "owui":
+        # No artifact written at all: the volume stays empty and this server needs no
+        # browser-reachable address. The trade is that a failed upload loses the render,
+        # because there is no second copy to fall back to.
+        public = settings.owui_public_url or settings.owui_url
+        if not settings.owui_public_url:
+            logger.warning(
+                "HIVE_DELIVERY_MODE=owui builds download links from %s, because "
+                "HIVE_OWUI_PUBLIC_URL is not set. That is the address this container "
+                "uses, which is usually not one a browser can open — set "
+                "HIVE_OWUI_PUBLIC_URL to the URL your users reach OpenWebUI at, or the "
+                "download button will lead nowhere.",
+                public,
+            )
+        return OwuiDelivery(owui, with_link=True, public_url=public)
+    if settings.delivery_mode == "link":
         return signed
     return CompositeDelivery(OwuiDelivery(owui), signed)
 
@@ -131,10 +154,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await stack.enter_async_context(mcp.session_manager.run())
             sweeper = asyncio.create_task(_sweep_loop(store))
             logger.info(
-                "HiveMCP started (env=%s, auth=session-token, owui=%s, brief_mode=%s, "
-                "skills=%s, mcp=/mcp, tools=/tools)",
+                "HiveMCP started (env=%s, auth=session-token, owui=%s, delivery=%s, "
+                "brief_mode=%s, skills=%s, mcp=/mcp, tools=/tools)",
                 settings.environment,
                 settings.owui_url or "NOT CONFIGURED - nothing can authenticate",
+                settings.delivery_mode,
                 "on (uses the model selected in the chat)"
                 if settings.llm_enabled
                 else "off (spec only)",
@@ -263,19 +287,29 @@ def _register_health(app: FastAPI, settings: Settings) -> None:
         A read-only or unmounted volume is the failure mode that silently breaks every
         render, so it is worth failing the probe over rather than serving errors.
         """
+        # Each volume separately. They are usually different mounts with different
+        # ownership, and a templates volume the container cannot write to would otherwise
+        # look healthy until the first administrator tried to add a template.
+        #
+        # In 'owui' mode no artifact is ever written, so the storage volume is not part
+        # of readiness. Demanding it would leave a correctly configured pod permanently
+        # unready over a mount it has no use for.
+        required = (
+            (("templates", settings.templates_dir),)
+            if settings.delivery_mode == "owui"
+            else (("storage", settings.tmp_dir), ("templates", settings.templates_dir))
+        )
+
         checks: dict[str, str] = {}
         try:
             settings.ensure_dirs()
         except OSError as exc:
-            checks["storage"] = f"unwritable: {exc}"
+            # Attributed to whatever is actually required, so an unusable artifact
+            # volume cannot fail readiness in a mode that never touches it.
+            for label, _ in required:
+                checks[label] = f"unwritable: {exc}"
 
-        # Both volumes, separately. They are usually different mounts with different
-        # ownership, and a templates volume the container cannot write to would otherwise
-        # look healthy until the first administrator tried to add a template.
-        for label, directory in (
-            ("storage", settings.tmp_dir),
-            ("templates", settings.templates_dir),
-        ):
+        for label, directory in required:
             if label in checks:
                 continue
             probe = directory / ".readyz"

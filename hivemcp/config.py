@@ -113,7 +113,29 @@ class Settings(BaseSettings):
         description="Base URL of the OpenWebUI instance, as reachable from this "
         "container. Session tokens are validated here and files are uploaded here.",
     )
+    owui_public_url: str | None = Field(
+        default=None,
+        description="Base URL of the same OpenWebUI as reached by a *browser*, used to "
+        "build download links in 'owui' delivery mode. Distinct from HIVE_OWUI_URL, "
+        "which is the address this container uses and is usually cluster-internal. "
+        "Falls back to HIVE_OWUI_URL when unset.",
+    )
     owui_timeout_seconds: float = 30.0
+
+    delivery_mode: Literal["both", "owui", "link"] = Field(
+        default="both",
+        description=(
+            "How a finished document reaches the user. "
+            "'both' uploads it to the caller's OpenWebUI files AND mints a signed link "
+            "on this server — the historical behaviour, and the only one where a failed "
+            "upload still yields the document. "
+            "'owui' uploads only: nothing is written to the artifact volume and this "
+            "server never needs to be reachable from a browser, so HIVE_PUBLIC_URL "
+            "stops mattering and the ingress can go. A failed upload loses the render. "
+            "'link' mints a signed link only: the file does not appear in the user's "
+            "OpenWebUI file list at all."
+        ),
+    )
 
     # --- Optional LLM expansion (hybrid mode) ----------------------------------
     # There is no separate LLM endpoint: expansion calls back into OpenWebUI's

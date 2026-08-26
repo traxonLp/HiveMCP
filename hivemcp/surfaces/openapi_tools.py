@@ -11,6 +11,7 @@ would waste context and read badly in the UI.
 
 from __future__ import annotations
 
+import re
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -48,6 +49,17 @@ def get_templates(request: Request) -> TemplateService:
 
 def get_skills(request: Request) -> SkillRegistry:
     return request.app.state.skills
+
+
+# OpenWebUI's own file-content route, absolute or relative. Matched on shape rather than
+# on the configured host, so a card still works after the instance moves — and matched at
+# all because a URL pointing there carries no signed token this server could verify.
+_OWUI_CONTENT = re.compile(r"/api/v1/files/(?P<file_id>[A-Za-z0-9._:-]+)/content/?$")
+
+
+def _owui_content_file_id(url: str) -> str | None:
+    match = _OWUI_CONTENT.search(url)
+    return match.group("file_id") if match else None
 
 
 ServiceDep = Annotated[DocumentService, Depends(get_service)]
@@ -304,6 +316,8 @@ async def show_download(
     request: Request,
     caller: CallerDep,
     download_url: str,
+    filename: str | None = None,
+    size_bytes: int | None = None,
     language: LanguageChoice = "auto",
 ) -> HTMLResponse:
     """Render a download card with a real button for a file HiveMCP just produced.
@@ -311,26 +325,46 @@ async def show_download(
     Pass the `download_url` from a create or edit result. Call this straight after
     generating: a URL inside a tool result is plain text and cannot be clicked, and any
     warnings on the result are easy to miss. Return the card as-is.
+
+    Also pass `filename` and `size_bytes` from that same result. They are only needed
+    when the server delivers through OpenWebUI's own files, where this server has no copy
+    to read them from, but passing them always is simpler than deciding when.
     """
     settings = request.app.state.settings
-    token = download_url.rstrip("/").rsplit("/", 1)[-1]
-    try:
-        payload = verify_ui_token(token, settings)
-    except SignatureError as exc:
-        raise HTTPException(
-            UNPROCESSABLE,
-            f"That is not a usable download link ({exc}). Pass the download_url exactly "
-            "as the create or edit tool returned it.",
-        ) from exc
 
-    artifact = request.app.state.store.get(str(payload.get("artifact_id", "")))
-    if artifact is None:
-        raise HTTPException(
-            UNPROCESSABLE,
-            "That file has expired. Generate it again to get a fresh link.",
-        )
+    file_id = _owui_content_file_id(download_url)
+    if file_id is not None:
+        # HIVE_DELIVERY_MODE=owui: the document lives in the caller's OpenWebUI files and
+        # never touched this server's volume, so there is no signed token to verify and no
+        # artifact to measure. The name and size have to come from the tool result.
+        if not filename:
+            raise HTTPException(
+                UNPROCESSABLE,
+                "This server delivers files through OpenWebUI, so the card needs "
+                "'filename' as well. Pass filename and size_bytes from the same result "
+                "the download_url came from.",
+            )
+        card_filename, card_size = filename, size_bytes
+    else:
+        token = download_url.rstrip("/").rsplit("/", 1)[-1]
+        try:
+            payload = verify_ui_token(token, settings)
+        except SignatureError as exc:
+            raise HTTPException(
+                UNPROCESSABLE,
+                f"That is not a usable download link ({exc}). Pass the download_url "
+                "exactly as the create or edit tool returned it.",
+            ) from exc
 
-    kind = artifact.filename.rsplit(".", 1)[-1].lower()
+        artifact = request.app.state.store.get(str(payload.get("artifact_id", "")))
+        if artifact is None:
+            raise HTTPException(
+                UNPROCESSABLE,
+                "That file has expired. Generate it again to get a fresh link.",
+            )
+        card_filename, card_size = artifact.filename, artifact.size_bytes
+
+    kind = card_filename.rsplit(".", 1)[-1].lower()
     if kind not in ("pptx", "docx", "xlsx"):
         kind = "pptx"
 
@@ -339,9 +373,9 @@ async def show_download(
     )
     html = render_download_card(
         url=download_url,
-        filename=artifact.filename,
+        filename=card_filename,
         kind=kind,  # type: ignore[arg-type]
-        size_bytes=artifact.size_bytes,
+        size_bytes=card_size,
         preferences=preferences,
         language=language,
     )

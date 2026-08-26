@@ -36,6 +36,14 @@ data:
   # protection, which rejects the Host header of any request arriving through a Service.
   HIVE_MCP_HOST: "0.0.0.0"
 
+  # both | owui | link. In 'owui' nothing is written to hivemcp-data and browsers
+  # never reach this service, so the Ingress in 03-service.yaml and HIVE_PUBLIC_URL
+  # above both become unnecessary. The cost is that a failed upload loses the render.
+  HIVE_DELIVERY_MODE: "both"
+  # Only used by delivery mode 'owui': where a browser reaches OpenWebUI. The value
+  # above is the in-cluster Service, which no laptop can open, so this one is separate.
+  HIVE_OWUI_PUBLIC_URL: "https://chat.example.com"
+
   HIVE_MAX_UPLOAD_MB: "50"
   # Renders are CPU-bound and run in worker threads. Keep this at or below the CPU limit
   # in 02-deployment.yaml, or the pod queues work it has no core to run.

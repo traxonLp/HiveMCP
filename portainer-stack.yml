@@ -72,6 +72,12 @@ services:
       # the model selected in the chat and the caller's own token.
       HIVE_LLM_ENABLED: ${HIVE_LLM_ENABLED:-false}
 
+      # both | owui | link. 'owui' means the file only ever lives in the caller's
+      # OpenWebUI files: no artifact volume, and HIVE_PUBLIC_URL stops mattering.
+      HIVE_DELIVERY_MODE: ${HIVE_DELIVERY_MODE:-both}
+      # Only for delivery mode 'owui': where a browser reaches OpenWebUI, e.g.
+      # http://192.168.1.50:3000. Not the container name from HIVE_OWUI_URL.
+      HIVE_OWUI_PUBLIC_URL: ${HIVE_OWUI_PUBLIC_URL:-}
       HIVE_MAX_UPLOAD_MB: ${HIVE_MAX_UPLOAD_MB:-50}
       HIVE_MAX_RENDER_CONCURRENCY: ${HIVE_MAX_RENDER_CONCURRENCY:-4}
       HIVE_TMP_TTL_MINUTES: ${HIVE_TMP_TTL_MINUTES:-60}

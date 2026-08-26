@@ -58,8 +58,16 @@ class SignedUrlDelivery:
 class OwuiDelivery:
     """Upload as the calling user, so the file appears in their own file list."""
 
-    def __init__(self, client: OwuiFilesClient) -> None:
+    def __init__(
+        self,
+        client: OwuiFilesClient,
+        *,
+        with_link: bool = False,
+        public_url: str | None = None,
+    ) -> None:
         self.client = client
+        self.with_link = with_link
+        self.public_url = (public_url or "").rstrip("/")
 
     async def deliver(self, rendered: RenderedFile, caller: Caller) -> DeliveryResult:
         file_id = await self.client.upload(
@@ -72,7 +80,28 @@ class OwuiDelivery:
             file_id,
             caller.identity.user_id,
         )
-        return DeliveryResult(file_id=file_id)
+        return DeliveryResult(file_id=file_id, download_url=self._link(file_id))
+
+    def _link(self, file_id: str) -> str | None:
+        """OpenWebUI's own content route, absolute.
+
+        Absolute rather than relative, and that is not a style choice. The download card
+        is embedded as a **cross-origin** iframe without ``allowSameOrigin`` — spike S7
+        and the notes in ``config_ui`` — so a relative href inside it resolves against
+        *HiveMCP's* address, not OpenWebUI's, and the button leads to a 404 here. Only
+        the markdown link in the assistant's own message would have worked relative,
+        because that one is rendered in OpenWebUI's page. One absolute URL is correct in
+        both places.
+
+        Whether the link is *clickable* is a separate question this server cannot answer:
+        HiveMCP reads that route with a Bearer header, and a link click sends none. If
+        OpenWebUI does not also honour its session cookie there, the click gets a 401 and
+        the file has to be opened from the user's file list — it is uploaded either way.
+        Worth verifying once against your instance.
+        """
+        if not self.with_link:
+            return None
+        return f"{self.public_url}/api/v1/files/{file_id}/content"
 
 
 class CompositeDelivery:

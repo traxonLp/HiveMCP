@@ -55,6 +55,37 @@ Darunter bei **Environment variables** anlegen:
 | `OWUI_NETWORK` | `openwebui_default` | exakt aus Schritt 1 |
 | `HIVE_PORT` | `8080` | optional, falls 8080 auf dem Host belegt ist |
 | `HIVEMCP_TAG` | `1.0.4` | optional, Default `latest` |
+| `HIVE_DELIVERY_MODE` | `both` | optional, siehe unten |
+
+### Auslieferungsweg
+
+`HIVE_DELIVERY_MODE` bestimmt, wie eine fertige Datei beim Nutzer landet.
+
+`both` (Default) lädt sie in die OpenWebUI-Dateien des Aufrufers **und** erzeugt
+zusätzlich einen signierten Link auf HiveMCP. Der einzige Modus, in dem ein
+fehlgeschlagener Upload das Dokument trotzdem noch ausliefert.
+
+`owui` lädt nur hoch. Nichts wird auf das Artefakt-Volume geschrieben, und HiveMCP muss
+für keinen Browser erreichbar sein — `HIVE_PUBLIC_URL` verliert damit seine Bedeutung und
+der Port muss nicht mehr veröffentlicht werden. Preis: schlägt der Upload fehl, ist das
+gerenderte Dokument verloren.
+
+`link` erzeugt nur den signierten Link; die Datei taucht in der Dateiliste gar nicht auf.
+
+Für `owui` kommt eine zweite Variable dazu: **`HIVE_OWUI_PUBLIC_URL`**, die Adresse, unter
+der ein *Browser* OpenWebUI erreicht — etwa `http://192.168.1.50:3000`. Nicht zu
+verwechseln mit `HIVE_OWUI_URL`, das der Containername ist und im Browser nichts
+auflöst. Bleibt sie leer, werden Links aus `HIVE_OWUI_URL` gebaut und führen ins Leere;
+das Log sagt das beim Start.
+
+Der Grund für die zweite Variable: die Download-Karte läuft als cross-origin iframe. Ein
+relativer Link darin löst gegen HiveMCPs Adresse auf, nicht gegen OpenWebUI — der Button
+liefe auf einen 404. Deshalb absolute URL.
+
+Vor dem Umstieg auf `owui` einmal prüfen, ob ein Download-Link ohne Bearer-Header
+funktioniert: im angemeldeten Browser `http://<owui>/api/v1/files/<file_id>/content`
+aufrufen. Lädt die Datei, ist der Link klickbar; kommt 401, liegt die Datei zwar korrekt
+in der Dateiliste, aber der Button im Chat funktioniert nicht.
 
 `HIVE_PUBLIC_URL` ist der Wert, der am häufigsten falsch gesetzt wird. Daraus werden die
 Download-Links gebaut. Steht dort `localhost`, funktionieren sie nur auf dem Docker-Host
