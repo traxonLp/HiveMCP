@@ -277,16 +277,69 @@ def test_signed_hivemcp_urls_are_not_mistaken_for_openwebui_ones() -> None:
     assert _owui_content_file_id("https://hivemcp.example.com/d/eyJhIjoxfQ.c2ln") is None
 
 
-def test_the_card_needs_a_filename_for_openwebui_urls(client_factory) -> None:
-    """There is no local artifact to read the name and size from in that mode."""
+def test_the_card_works_without_a_filename(client_factory, monkeypatch) -> None:
+    """The button must not depend on the model remembering a parameter.
+
+    An earlier version answered 422 when 'filename' was missing, which turned a working
+    download into a coin flip over whether the model passed it along. The server asks
+    OpenWebUI instead.
+    """
     with client_factory("owui") as client:
+        async def metadata(file_id: str, token: str) -> dict[str, object]:
+            return {"filename": "Quartal.xlsx", "size_bytes": 4096}
+
+        client.app.state.owui.get_metadata = metadata
         response = client.get(
             "/tools/show_download",
             params={"download_url": "https://chat.example.com/api/v1/files/a/content"},
             headers=SESSION,
         )
-    assert response.status_code == 422
-    assert "filename" in response.json()["detail"]
+
+    assert response.status_code == 200
+    assert "Quartal.xlsx" in response.text
+
+
+def test_the_card_survives_openwebui_not_answering(client_factory) -> None:
+    """A generic name beats an error: the link is the part that matters, and it is known."""
+    from hivemcp.core.files.owui_client import OwuiError
+
+    with client_factory("owui") as client:
+        async def failing(file_id: str, token: str) -> dict[str, object]:
+            raise OwuiError("nope")
+
+        client.app.state.owui.get_metadata = failing
+        response = client.get(
+            "/tools/show_download",
+            params={"download_url": "https://chat.example.com/api/v1/files/a/content"},
+            headers=SESSION,
+        )
+
+    assert response.status_code == 200
+    assert "https://chat.example.com/api/v1/files/a/content" in response.text
+
+
+def test_supplied_values_win_over_a_lookup(client_factory) -> None:
+    """The common path costs no extra request."""
+    called = []
+
+    with client_factory("owui") as client:
+        async def metadata(file_id: str, token: str) -> dict[str, object]:
+            called.append(file_id)
+            return {}
+
+        client.app.state.owui.get_metadata = metadata
+        response = client.get(
+            "/tools/show_download",
+            params={
+                "download_url": "https://chat.example.com/api/v1/files/a/content",
+                "filename": "Bericht.pptx",
+                "size_bytes": 2048,
+            },
+            headers=SESSION,
+        )
+
+    assert response.status_code == 200
+    assert called == [], "metadata was fetched even though it was supplied"
 
 
 def test_the_card_renders_for_an_openwebui_url(client_factory) -> None:

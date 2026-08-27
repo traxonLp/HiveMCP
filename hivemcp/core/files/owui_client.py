@@ -101,6 +101,51 @@ class OwuiFilesClient:
             )
         return data
 
+    async def get_metadata(self, file_id: str, token: str) -> dict[str, object]:
+        """Name and size of a file already in OpenWebUI.
+
+        Used to build the download card in ``owui`` delivery mode, where this server
+        keeps no copy and therefore knows neither. The alternative was to have the model
+        pass them back from the tool result, which works until the model forgets — and a
+        download button that fails because a parameter was omitted is a bad trade for one
+        cheap request.
+
+        Deliberately forgiving. The exact response shape is OpenWebUI's business and has
+        changed across versions, so this reads several plausible keys and returns what it
+        found rather than insisting on a schema. A card with a generic name still beats no
+        card, so the caller treats an empty dict as "unknown", not as an error.
+        """
+        client = self._require()
+        try:
+            response = await client.get(
+                f"/api/v1/files/{file_id}", headers=self._auth(token)
+            )
+        except httpx.HTTPError as exc:
+            raise OwuiError(f"could not reach OpenWebUI: {exc}") from exc
+
+        if response.status_code >= 400:
+            raise OwuiError(
+                f"OpenWebUI returned {response.status_code} for file {file_id!r}"
+            )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise OwuiError("OpenWebUI returned a non-JSON file record") from exc
+        if not isinstance(payload, dict):
+            return {}
+
+        meta = payload.get("meta")
+        meta = meta if isinstance(meta, dict) else {}
+        name = payload.get("filename") or payload.get("name") or meta.get("name")
+        size = payload.get("size") or meta.get("size") or meta.get("content_length")
+
+        found: dict[str, object] = {}
+        if isinstance(name, str) and name:
+            found["filename"] = name
+        if isinstance(size, int) and size >= 0:
+            found["size_bytes"] = size
+        return found
+
     # ----------------------------------------------------------------- write
 
     async def upload(self, data: bytes, filename: str, media_type: str, token: str) -> str:

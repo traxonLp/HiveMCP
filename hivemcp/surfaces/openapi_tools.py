@@ -11,6 +11,7 @@ would waste context and read badly in the UI.
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Annotated
 
@@ -29,12 +30,15 @@ from ..core.models import (
     RenderResult,
     SheetSpec,
 )
+from ..core.files.owui_client import OwuiError
 from ..core.service import DocumentService, ToolError
 from ..core.skills import SkillError, SkillRegistry
 from ..core.templates.service import TemplateService
 from ..core.templates.store import NotPermitted, TemplateError, TemplateKind
 from .config_ui import ConfigKind, LanguageChoice, ThemeChoice, render_config_page
 from .download_ui import render_download_card
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/tools", tags=["documents"])
 
@@ -326,25 +330,35 @@ async def show_download(
     generating: a URL inside a tool result is plain text and cannot be clicked, and any
     warnings on the result are easy to miss. Return the card as-is.
 
-    Also pass `filename` and `size_bytes` from that same result. They are only needed
-    when the server delivers through OpenWebUI's own files, where this server has no copy
-    to read them from, but passing them always is simpler than deciding when.
+    Passing `filename` and `size_bytes` from that same result saves a lookup, but they
+    are optional: if they are missing the server works them out itself. Do not skip
+    calling this tool because you do not have them.
     """
     settings = request.app.state.settings
 
     file_id = _owui_content_file_id(download_url)
     if file_id is not None:
         # HIVE_DELIVERY_MODE=owui: the document lives in the caller's OpenWebUI files and
-        # never touched this server's volume, so there is no signed token to verify and no
-        # artifact to measure. The name and size have to come from the tool result.
-        if not filename:
-            raise HTTPException(
-                UNPROCESSABLE,
-                "This server delivers files through OpenWebUI, so the card needs "
-                "'filename' as well. Pass filename and size_bytes from the same result "
-                "the download_url came from.",
-            )
+        # never touched this server's volume, so there is no signed token to verify and
+        # no artifact to measure.
+        #
+        # The name and size are asked of OpenWebUI rather than required from the caller.
+        # An earlier version refused with a 422 when 'filename' was missing, which made a
+        # working download button depend on the model remembering to pass a parameter —
+        # and models forget. Supplied values still win, so the common path costs nothing.
         card_filename, card_size = filename, size_bytes
+        if not card_filename:
+            try:
+                found = await request.app.state.owui.get_metadata(file_id, caller.token)
+            except OwuiError:
+                # Not fatal. A card with a generic name is worth more than an error, and
+                # the link itself — the part that matters — is already known.
+                logger.warning("could not read file metadata for %s", file_id, exc_info=True)
+                found = {}
+            card_filename = str(found.get("filename") or "") or card_filename
+            if card_size is None and isinstance(found.get("size_bytes"), int):
+                card_size = int(found["size_bytes"])  # type: ignore[arg-type]
+        card_filename = card_filename or "document"
     else:
         token = download_url.rstrip("/").rsplit("/", 1)[-1]
         try:
