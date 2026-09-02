@@ -4,7 +4,7 @@
   <img src="assets/HiveMCP_Banner.png" alt="HiveMCP">
 </p>
 
-<p align="center"><strong>1.0.5</strong></p>
+<p align="center"><strong>1.0.6</strong></p>
 
 ---
 
