@@ -112,9 +112,12 @@ class MarkdownRenderer:
                 raise RenderError(f"block {index + 1}: unknown type {block.type!r}")
             try:
                 produced = handler(block, spec)
-            except RenderError:
-                raise
             except Exception as exc:  # noqa: BLE001 - a bad block must name itself
+                # Re-wrapped even when it is already a RenderError, matching pptx and
+                # docx. An `except RenderError: raise` here reads like it preserves the
+                # better message, and instead throws away the only thing this frame
+                # knows: *which* block failed. The PowerPoint renderer lost slide numbers
+                # to exactly this once already.
                 raise RenderError(
                     f"block {index + 1} ({block.type}) could not be rendered: {exc}"
                 ) from exc
