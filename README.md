@@ -4,11 +4,11 @@
   <img src="assets/HiveMCP_Banner.png" alt="HiveMCP">
 </p>
 
-<p align="center"><strong>1.0.4</strong></p>
+<p align="center"><strong>1.0.5</strong></p>
 
 ---
 
-Generates and edits PowerPoint, Word and Excel files for [OpenWebUI](https://openwebui.com).
+Generates and edits PowerPoint, Word, Excel and Markdown files for [OpenWebUI](https://openwebui.com).
 Runs as a container, exposed both as an **MCP Streamable HTTP** server and as an
 **OpenAPI tool server** from the same FastAPI app.
 
@@ -22,14 +22,21 @@ GUI.
 | Tool | Who can use it |
 |---|---|
 | `hive_create_presentation` · `hive_create_document` · `hive_create_spreadsheet` | everyone |
+| `hive_create_markdown` — README, release notes, static-site posts | everyone |
 | `hive_read_document` · `hive_edit_document` — patch a file from the chat | everyone |
 | `hive_show_download` — download card with a real button | everyone |
 | `hive_list_templates` · `hive_inspect_template` | everyone |
 | `hive_upload_template` · `hive_delete_template` | administrators |
 | `hive_open_config` — settings card rendered inline in the chat | everyone |
+| `hive_usage_guide` — the bundled skill, the one tool that needs no session | everyone |
 
-Generated files are uploaded with the caller's own session token, so they appear in that
-person's OpenWebUI file list, and a signed download link is attached as well.
+Markdown takes the *same* `DocSpec` as Word. The block types already describe a document,
+so a second spec would only be a second thing for a model to learn and for this repository
+to keep in step.
+
+How finished files reach the user is a setting, `HIVE_DELIVERY_MODE`: uploaded to the
+caller's own OpenWebUI files, handed over as a signed link from this server, or both
+(the default, and the only mode where a failed upload still yields the document).
 
 ## Status
 
@@ -42,7 +49,10 @@ person's OpenWebUI file list, and a signed download link is attached as well.
 | M4 | Templates: admin-curated pool, upload, inspect | **done** |
 | M5 | Configuration GUI as an iframe | **done** |
 | M6 | Editing files uploaded to the chat | **done** |
-| M7 | Skill, K8s manifests, hardening | open |
+| M7 | Skill, K8s manifests, hardening | **done** |
+
+Since M7: configurable delivery, Markdown as a fourth format, and cards that follow
+OpenWebUI's theme live.
 
 ## Quick start
 
@@ -51,9 +61,14 @@ uv venv && source .venv/bin/activate
 uv pip install -e ".[dev]"
 cp .env.example .env
 
-pytest
-python -m hivemcp          # http://localhost:8080/healthz
+make test                 # runs the suite in the container, no host Python needed
+python -m hivemcp         # http://localhost:8080/healthz
 ```
+
+`make test` builds the `test` stage of the Dockerfile and runs pytest inside it, so the
+suite executes against the same interpreter and the same pinned dependencies as
+production. `make test ARGS="-k templates -x"` passes arguments straight through.
+`make test-host` runs it locally instead, if you have the dev extras installed.
 
 ## Docker
 
@@ -129,18 +144,25 @@ hivemcp/
     mcp_server.py           MCP Streamable HTTP, stateless, mounted at /mcp
     openapi_tools.py        /tools/* with explicit operation ids
     config_ui.py            the settings card, rendered inline in the chat
+    download_ui.py          the download card
+    theme_ui.py             theme sync shared by both cards
+    skills_api.py           GET /skills/{name}, the guide as plain Markdown
     debug.py                dev-only diagnostics under /_debug
   core/
     service.py              shared logic: validation, render semaphore, delivery
     models.py               DeckSpec / DocSpec / SheetSpec / RenderOptions
-    delivery.py             OpenWebUI upload plus a signed link
-    preferences.py          interface theme and locale, and how to read them
-    render/                 pptx.py, docx.py, xlsx.py, theme.py
+    delivery.py             the three delivery modes
+    skills.py               the bundled usage guide, loaded once at start-up
+    preferences.py          interface locale, and how to read it
+    render/                 pptx.py, docx.py, xlsx.py, markdown.py, theme.py
+    editing/                read.py and apply.py — patching uploaded files
     templates/              admin-curated pool, inspection, upload validation
     llm/                    brief expansion through the user's selected model
     files/owui_client.py    OpenWebUI Files API
     files/workdir.py        artifact store, with TTL sweep
+  skills/hivemcp-usage/     SKILL.md, shipped inside the package on purpose
 deploy/                     Dockerfile, docker-compose.yml, smoke.sh, k8s/, PORTAINER.md
+portainer-stack.yml         Portainer stack, at the root because of build-context paths
 docs/                       OPENWEBUI_SETUP.md
 tests/
 ```
@@ -171,15 +193,45 @@ printer driver, so no library can know the real count. The result field is calle
 **Errors name their location.** A failure on slide 7 says so, because the model needs to
 know where to fix the spec, not just what was wrong.
 
-**The settings card matches OpenWebUI's theme through CSS, not through an API.** Nothing
-tells it: postMessage carries no appearance message, `window.args` needs `allowSameOrigin`,
-and OpenWebUI keeps the theme in the browser's localStorage rather than server-side. It
-does not need to be told. `prefers-color-scheme` evaluated *inside an iframe* reports the
-colour scheme of the embedding element, cross-origin included — resolved deliberately by
-the CSS Working Group. The one thing that makes it work is declaring `color-scheme: light
-dark`: pinning a single scheme both stops the query tracking the embedder and, per CSS
-Color Adjust, replaces the transparent canvas with an opaque one, turning the card into a
-white rectangle inside a dark chat. A toggle remains for instances that declare no scheme.
+**The cards read OpenWebUI's theme off the page, and follow it live.** Nothing tells
+them: postMessage carries no appearance message, `window.args` needs `allowSameOrigin`,
+and OpenWebUI keeps the theme in the browser rather than in server-side settings. So the
+cards look. OpenWebUI marks its own theme with `class="dark"` on `<html>`; each card
+mirrors that class and watches it with a `MutationObserver`, which is what makes a theme
+switch arrive without reloading the card.
+
+`prefers-color-scheme` is the fallback, for when `parent.document` is out of reach —
+cross-origin, or a sandbox without `allow-same-origin`. That is a normal configuration
+rather than an error, so it is caught silently. It is second rather than first because it
+only reflects OpenWebUI when OpenWebUI declares a `color-scheme` on the iframe element;
+when it does not, the query falls through to the operating system, and a dark OpenWebUI on
+a light desktop produced a white card in a dark chat.
+
+The two must not contradict each other. Once the parent has been read the script records
+the answer in `data-parent-theme`, and the media query is written to stand down whenever
+that attribute is present — otherwise a parent correctly read as *light* would still be
+painted dark by a dark OS.
+
+Either way the card declares `color-scheme: light dark` on `:root`. Pinning a single
+scheme replaces the transparent canvas with an opaque one, per CSS Color Adjust, turning
+the card into a white rectangle inside a dark chat. There is no theme toggle and no
+server-side guess: both existed to correct answers this no longer gets wrong.
+
+**Markdown maps what it can and warns about the rest.** `page_break` becomes a thematic
+break; a `toc` block is written out as links with GitHub-style anchors, because Markdown
+has no field the reader's application fills in; images are embedded as data URIs, since
+there is nowhere to put a companion file. Fonts, sizes, page size and orientation produce
+a warning rather than being silently ignored — a dead option that changes nothing is worse
+than one that says so. Escaping is deliberately narrow: only a marker that *opens a line*
+is escaped, so prose containing an asterisk stays readable, while a pipe inside a table
+cell is always escaped because it would end the cell.
+
+A Markdown template is a plain `.md` file with `{{placeholders}}` and one `{{content}}`
+marker. `hive_inspect_template` reports both, including when the marker is missing —
+without it the body is appended, which is rarely what the author meant. Editing Markdown
+is addressed by *line* rather than by paragraph: that is what a diff speaks, and a
+paragraph index would have to be derived from blank-line grouping, which is a thing to get
+wrong.
 
 **Language comes from the model, not the server.** The interface locale is client-side too,
 so `hive_open_config` takes a `language` argument and the tool description asks the model
@@ -242,9 +294,16 @@ See [`.env.example`](.env.example). The container holds no third-party credentia
   a request lands on a different pod than the one that signed the link.
 - `HIVE_TEMPLATES_DIR` — the shared template pool. Defaults to a subdirectory of
   `HIVE_DATA_DIR`; give it its own volume so the curated templates survive clearing the
-  artifact volume. See [`deploy/k8s/templates-pvc.yaml`](deploy/k8s/templates-pvc.yaml).
+  artifact volume. See [`deploy/k8s/00-storage.yaml`](deploy/k8s/00-storage.yaml).
 - `HIVE_ENVIRONMENT=dev` — mounts the diagnostic endpoints under `/_debug`. They reflect
   request headers back to the caller, so set `prod` anywhere that is reachable by others.
+- `HIVE_DELIVERY_MODE` — `both` (default), `owui` or `link`. In `owui` nothing is written
+  to the artifact volume and this server never needs to be reachable from a browser, so
+  `HIVE_PUBLIC_URL` and the ingress become unnecessary. The cost is that a failed upload
+  loses the render, because there is no second copy to fall back on.
+- `HIVE_OWUI_PUBLIC_URL` — only used by `HIVE_DELIVERY_MODE=owui`: the address a *browser*
+  reaches OpenWebUI at, as opposed to `HIVE_OWUI_URL`, which is the one this container
+  uses and is usually a service name no laptop can resolve.
 
 ## Adding a template
 
@@ -254,6 +313,8 @@ Attach the file in the chat as an administrator and say what it should be called
 
 HiveMCP validates it by opening it, stores it in the shared pool, and returns the same
 report `hive_inspect_template` gives — layouts, styles and `{{placeholders}}` — so no
-second call is needed. Everyone can then use it by passing `template_id` in
+second call is needed. A Markdown template is a plain `.md` file instead: no layouts to
+inspect, just placeholders and a `{{content}}` marker saying where the generated body
+goes. Everyone can then use it by passing `template_id` in
 `RenderOptions`. Non-administrators get a 403 that says so rather than a validation error
 they would try to fix by retrying.

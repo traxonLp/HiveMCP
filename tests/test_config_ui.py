@@ -19,7 +19,9 @@ from hivemcp.config import Settings
 from hivemcp.core.models import DeckSpec, RenderOptions, Slide
 from hivemcp.core.preferences import UserPreferences, parse_preferences
 from hivemcp.core.render.pptx import render_presentation
-from hivemcp.surfaces.config_ui import dark_css, js_literal, render_config_page
+from hivemcp.surfaces.config_ui import js_literal, render_config_page
+from hivemcp.surfaces.download_ui import render_download_card
+from hivemcp.surfaces.theme_ui import dark_css
 
 TEMPLATES = [
     {
@@ -145,100 +147,147 @@ def test_the_background_is_transparent() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_a_known_dark_instance_is_dark_regardless_of_the_operating_system() -> None:
-    """A known theme is pinned, so the OS never gets a vote.
+def _card_script(html: str) -> str:
+    return SCRIPT_BLOCK.search(html).group(1)
 
-    Asserted against the generated rule from ``dark_css`` rather than against a substring
-    of the whole page: the words "prefers-color-scheme" and "getComputedStyle" both
-    appear in explanatory comments in the stylesheet and the script, so a naive
-    ``not in html`` matches the prose and fails on correct output.
+
+def _card_css(html: str) -> str:
+    return STYLE_BLOCK.search(html).group(1)
+
+
+CARDS = {
+    "config": lambda: render_config_page("pptx", TEMPLATES),
+    "download": lambda: render_download_card(
+        url="https://example.test/d/abc", filename="Bericht.pptx", kind="pptx"
+    ),
+}
+
+
+@pytest.mark.parametrize("card", list(CARDS))
+def test_the_card_reads_the_parents_dark_class(card: str) -> None:
+    """The primary mechanism, and the reason it is primary.
+
+    OpenWebUI marks its theme with `class="dark"` on <html>. Reading that reads the
+    *visibly active* theme, including a manual choice. `prefers-color-scheme` cannot:
+    inside an iframe it reports the embedding element's colour scheme, and when OpenWebUI
+    declares none it falls through to the operating system — so a dark OpenWebUI on a
+    light desktop produced a white card in a dark chat.
     """
-    rules = dark_css("dark")
+    script = _card_script(CARDS[card]())
 
-    assert "color-scheme: dark" in rules
-    assert "@media" not in rules, "a known theme must not depend on a media query"
+    assert "parent.document.documentElement" in script
+    assert "classList.contains('dark')" in script
 
 
-def test_a_known_light_instance_never_turns_dark_on_its_own() -> None:
-    """Light stays light unless the user asks in the card.
+@pytest.mark.parametrize("card", list(CARDS))
+def test_a_theme_switch_arrives_without_a_reload(card: str) -> None:
+    script = _card_script(CARDS[card]())
 
-    The dark variables are still emitted, but only behind ``[data-theme="dark"]`` — that
-    is what keeps the manual toggle working on a light instance. What must not survive is
-    any rule that could fire without that attribute.
+    assert "MutationObserver" in script
+    # Only the class attribute: OpenWebUI mutates its root for many reasons, and watching
+    # all of them would run the handler on every unrelated change.
+    assert "attributeFilter: ['class']" in script
+
+
+@pytest.mark.parametrize("card", list(CARDS))
+def test_an_unreachable_parent_is_silent(card: str) -> None:
+    """Cross-origin or a sandbox without allow-same-origin is a normal configuration.
+
+    It must not surface as an error to the user, and it must not stop the rest of the
+    script — the height reporting lives in the same block.
     """
-    rules = dark_css("light")
+    script = _card_script(CARDS[card]())
 
-    assert "@media" not in rules
-    assert '[data-theme="dark"]' in rules
-    assert ':not([data-theme="light"])' not in rules
+    assert "try {" in script
+    assert "catch" in script
+    assert "console.error" not in script
+    assert "localStorage" not in script, "reading OpenWebUI's storage is a non-goal"
 
 
-def test_the_card_accepts_both_schemes_so_the_embedder_decides() -> None:
-    """This single declaration is the whole theme-matching mechanism.
+@pytest.mark.parametrize("card", list(CARDS))
+def test_the_sync_script_is_not_html_escaped(card: str) -> None:
+    """It travels through an autoescaping template.
 
-    `prefers-color-scheme` inside an iframe reports the *embedding element's* colour
-    scheme, cross-origin included, so the media query below asks OpenWebUI rather than
-    the operating system. Declaring one scheme breaks it twice over: the query stops
-    tracking the embedder, and CSS Color Adjust gives an embedded document whose used
-    scheme differs from its embedder an opaque canvas — a white rectangle in a dark chat.
+    An escaped apostrophe arrives as `&#39;` and breaks the script rather than protecting
+    it — the same trap that js_literal exists for.
     """
-    css = STYLE_BLOCK.search(render_config_page("pptx", TEMPLATES)).group(1)
+    script = _card_script(CARDS[card]())
 
-    assert "color-scheme: light dark" in css
-    assert not re.search(r"color-scheme:\s*light\s*;", css), "must not pin a single scheme"
-    assert "@media (prefers-color-scheme: dark)" in css
-
-
-def test_an_explicit_dark_request_pins_the_scheme_too() -> None:
-    """Overriding the embedder means the canvas has to be told as well, or the form
-    controls stay in the embedder's scheme."""
-    css = STYLE_BLOCK.search(render_config_page("pptx", TEMPLATES, theme="dark")).group(1)
-
-    assert "color-scheme: dark" in css
+    assert "&#39;" not in script
+    assert "&#34;" not in script
+    assert "&amp;" not in script
 
 
-def test_the_toggle_reads_the_media_query_not_the_declaration() -> None:
-    """With `color-scheme: light dark` the computed value is the declaration itself, not
-    the scheme in use, so getComputedStyle would report 'light dark' and never flip."""
-    script = SCRIPT_BLOCK.search(render_config_page("pptx", TEMPLATES)).group(1)
-    code = "\n".join(
-        line for line in script.splitlines() if not line.lstrip().startswith("//")
-    )
-
-    assert "matchMedia('(prefers-color-scheme: dark)')" in code
-    assert "getComputedStyle" not in code
-    assert "root.style.colorScheme" in code, "an override must pin the scheme"
+@pytest.mark.parametrize("card", list(CARDS))
+def test_dark_rules_respond_to_the_synced_class(card: str) -> None:
+    assert ":root.dark" in _card_css(CARDS[card]())
 
 
-def test_an_explicit_theme_beats_the_stored_preference() -> None:
-    html = render_config_page(
-        "pptx", TEMPLATES, preferences=UserPreferences(theme="light"), theme="dark"
-    )
-
-    assert dark_css("dark") in html
-    assert dark_css("light") not in html
+@pytest.mark.parametrize("card", list(CARDS))
+def test_the_media_query_fallback_survives(card: str) -> None:
+    assert "@media (prefers-color-scheme: dark)" in _card_css(CARDS[card]())
 
 
-@pytest.mark.parametrize(
-    ("preferences", "theme"),
-    [
-        (UserPreferences(theme="dark"), "auto"),
-        (UserPreferences(theme="light"), "auto"),
-        (UserPreferences(), "auto"),
-        (UserPreferences(), "light"),
-        (UserPreferences(), "dark"),
-    ],
-)
-def test_the_stylesheet_stays_valid_in_every_theme(
-    preferences: UserPreferences, theme: str
-) -> None:
-    """The media-query variant needs an extra closing brace; an unbalanced stylesheet
-    would take the rest of the page's styling with it."""
-    css = STYLE_BLOCK.search(
-        render_config_page("pptx", TEMPLATES, preferences=preferences, theme=theme)
-    ).group(1)
+@pytest.mark.parametrize("card", list(CARDS))
+def test_the_fallback_stands_down_once_the_parent_is_known(card: str) -> None:
+    """The two mechanisms must not contradict each other.
+
+    Without this selector a parent correctly read as *light* would still be painted dark
+    by a dark operating system — the media query would simply overrule the better answer.
+    """
+    css = _card_css(CARDS[card]())
+
+    assert ":root:not([data-parent-theme])" in css
+    assert "@media (prefers-color-scheme: dark) {\n    :root {" not in css
+
+
+@pytest.mark.parametrize("card", list(CARDS))
+def test_the_root_accepts_both_schemes(card: str) -> None:
+    """Declaring a single scheme is what breaks embedding.
+
+    A document whose used scheme differs from its embedder gets an *opaque* canvas, so a
+    card pinned to light becomes a white rectangle in a dark chat.
+    """
+    assert "color-scheme: light dark" in _card_css(CARDS[card]())
+
+
+@pytest.mark.parametrize("card", list(CARDS))
+def test_the_stylesheet_stays_balanced(card: str) -> None:
+    css = _card_css(CARDS[card]())
 
     assert css.count("{") == css.count("}")
+
+
+def test_no_toggle_button_is_rendered() -> None:
+    html = render_config_page("pptx", TEMPLATES)
+
+    assert "theme-toggle" not in html
+    assert "toggle_theme" not in html
+
+
+def test_the_theme_no_longer_depends_on_stored_preferences() -> None:
+    """Two instances that differ only in the stored theme must render identically.
+
+    OpenWebUI keeps the interface theme in the browser, so the server-side lookup was
+    usually empty — and when it did answer, it froze the card at render time.
+    """
+    dark = render_config_page("pptx", TEMPLATES, preferences=UserPreferences(theme="dark"))
+    light = render_config_page("pptx", TEMPLATES, preferences=UserPreferences(theme="light"))
+
+    assert dark == light
+
+
+def test_the_download_card_has_its_own_dark_values() -> None:
+    """It defines --surface, --warn-bg and --warn-fg, which the config card does not.
+
+    Both cards used to share one set of dark variables, so in dark mode the download
+    card's warning box kept its light values: dark brown text on a dark panel.
+    """
+    css = _card_css(CARDS["download"]())
+    dark_block = css.split(":root.dark")[1]
+
+    assert "--warn-fg" in dark_block
+    assert "--surface" in dark_block
 
 
 # --------------------------------------------------------------------------- #
@@ -413,15 +462,16 @@ def test_open_config_requires_a_session(client: TestClient) -> None:
     assert client.get("/tools/open_config").status_code == 401
 
 
-def test_open_config_follows_the_users_openwebui_settings(client: TestClient) -> None:
+def test_open_config_follows_the_users_openwebui_locale(client: TestClient) -> None:
+    """Language still comes from settings. The theme deliberately no longer does."""
     client.app.state.preferences = FakePreferences(
         UserPreferences(theme="dark", locale="de-DE")
     )
 
     html = client.get("/tools/open_config?kind=pptx", headers=SESSION).text
 
-    assert dark_css("dark") in html
     assert 'lang="de"' in html
+    assert dark_css() in html
 
 
 def test_open_config_still_renders_when_settings_cannot_be_read(

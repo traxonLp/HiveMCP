@@ -61,7 +61,9 @@ def apply_edits(
     if not operations:
         raise EditError("no operations were given, so there is nothing to change")
 
-    editors = {"pptx": _edit_pptx, "docx": _edit_docx, "xlsx": _edit_xlsx}
+    editors = {
+        "pptx": _edit_pptx, "docx": _edit_docx, "xlsx": _edit_xlsx, "md": _edit_md
+    }
     editor = editors.get(kind)
     if editor is None:
         raise EditError(f"cannot edit a document of kind {kind!r}")
@@ -390,3 +392,72 @@ def _neutralise(text: str) -> str:
 
 
 __all__ = ["EditError", "apply_edits", "DocumentUnreadable"]
+
+
+# --------------------------------------------------------------------------- #
+# Markdown
+# --------------------------------------------------------------------------- #
+
+
+def _edit_md(data: bytes, operations: list[EditOp], applied: Applied) -> bytes:
+    """Patch a Markdown file line by line.
+
+    Simpler than its OOXML counterparts and deliberately so: the file is text, so there
+    is no document model to preserve and no risk of a structural edit invalidating a
+    relationship. What is preserved instead is everything the operations do not touch —
+    including whether the file ended with a newline, because flipping that turns a
+    no-op edit into a one-line diff.
+    """
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise EditError("this file is not valid UTF-8 text, so it is not Markdown") from exc
+
+    trailing_newline = text.endswith("\n")
+    lines = text.splitlines()
+
+    for index, op in enumerate(operations, start=1):
+        if op.op == "set_line":
+            if not 1 <= op.line <= len(lines):
+                raise EditError(
+                    f"operation {index}: this file has {len(lines)} line(s), so there is "
+                    f"no line {op.line}."
+                )
+            lines[op.line - 1] = op.text
+            applied.did(f"replaced line {op.line}.")
+
+        elif op.op == "append_paragraph":
+            # A blank line first, or the appended text joins the previous paragraph.
+            if lines and lines[-1].strip():
+                lines.append("")
+            lines.append(op.text)
+            applied.did("appended a paragraph.")
+
+        elif op.op == "replace_text":
+            count = 0
+            for position, line in enumerate(lines):
+                replaced, hits = _substitute(line, op.find, op.replace, op.match_case)
+                if hits:
+                    lines[position] = replaced
+                    count += hits
+            message = f"replaced {op.find!r} in {count} place(s)."
+            applied.did(message) if count else applied.changed_nothing(index, message)
+
+        elif op.op == "fill_placeholders":
+            total = 0
+            for key, value in op.values.items():
+                token = "{{" + key + "}}"
+                for position, line in enumerate(lines):
+                    if token in line:
+                        lines[position] = line.replace(token, value)
+                        total += line.count(token)
+            message = f"filled {total} placeholder occurrence(s)."
+            applied.did(message) if total else applied.changed_nothing(index, message)
+
+        else:
+            raise _wrong_kind(index, op, "md")
+
+    output = "\n".join(lines)
+    if trailing_newline:
+        output += "\n"
+    return output.encode("utf-8")

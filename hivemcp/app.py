@@ -181,7 +181,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         title="HiveMCP",
         version=__version__,
         description=(
-            "Generates and edits PowerPoint, Word and Excel files for OpenWebUI. "
+            "Generates and edits PowerPoint, Word, Excel and Markdown files for OpenWebUI. "
             "Exposed both as an MCP Streamable HTTP server and as an OpenAPI tool server."
         ),
         lifespan=lifespan,

@@ -14,13 +14,13 @@ Theme and escaping follow the same rules as the settings card — see ``config_u
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Literal
 
 from jinja2 import Environment, select_autoescape
 from markupsafe import Markup
 
 from ..core.preferences import UserPreferences
-from .config_ui import DARK_VARIABLES, dark_css
+from .theme_ui import DOWNLOAD_DARK_VARIABLES, PARENT_THEME_SYNC, dark_css
 
 DownloadKind = Literal["pptx", "docx", "xlsx"]
 
@@ -128,6 +128,7 @@ CARD_HTML = """<!DOCTYPE html>
   <p class="expiry">{{ t.expires }}</p>
 
 <script>
+{{ theme_sync }}
   function reportHeight() {
     parent.postMessage(
       { type: 'iframe:height', height: document.documentElement.scrollHeight }, '*');
@@ -175,8 +176,9 @@ def render_download_card(
         size=human_size(size_bytes),
         detail=detail,
         warnings=warnings or [],
-        dark_css=dark_css(preferences.theme or "auto"),
+        dark_css=dark_css(DOWNLOAD_DARK_VARIABLES),
+        theme_sync=PARENT_THEME_SYNC,
     )
 
 
-__all__ = ["DownloadKind", "render_download_card", "human_size", "DARK_VARIABLES"]
+__all__ = ["DownloadKind", "render_download_card", "human_size"]

@@ -153,6 +153,12 @@ class RenderOptions(StrictModel):
     include_toc: bool = Field(
         default=False, description="Insert a table of contents field (docx only)."
     )
+    frontmatter: bool = Field(
+        default=False,
+        description="Prepend YAML front matter with title, author and language "
+        "(Markdown only). Turn this on for static-site generators such as Hugo or "
+        "Jekyll; leave it off for a plain README or notes file.",
+    )
     page_size: Literal["A4", "Letter"] = "A4"
     orientation: Literal["portrait", "landscape"] = "portrait"
     filename: str | None = Field(
@@ -431,6 +437,21 @@ class SetCell(StrictModel):
     type: CellType = "text"
 
 
+class SetLine(StrictModel):
+    """Replace one line of a Markdown file.
+
+    Lines rather than paragraphs: Markdown's unit of address is the line, which is what
+    hive_read_document reports and what a diff speaks. A paragraph index would have to be
+    derived from blank-line grouping, and a model deriving it is a model getting it wrong.
+    """
+
+    op: Literal["set_line"] = "set_line"
+    line: int = Field(
+        ge=1, description="1-based line number, as hive_read_document reports it."
+    )
+    text: str = Field(description="The replacement line. Empty string blanks it.")
+
+
 EditOp = Annotated[
     ReplaceText
     | FillPlaceholders
@@ -439,6 +460,7 @@ EditOp = Annotated[
     | SetNotes
     | SetParagraph
     | AppendParagraph
+    | SetLine
     | SetCell,
     Field(discriminator="op"),
 ]

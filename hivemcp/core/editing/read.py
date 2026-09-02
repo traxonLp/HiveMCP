@@ -34,12 +34,16 @@ class DocumentUnreadable(Exception):
 def read_document(path: Path, kind: str, mode: ReadMode = "outline") -> dict[str, Any]:
     # An uploaded document is an untrusted archive, and the parsers below expand whatever
     # they are given. Same guard as for templates.
-    try:
-        assert_safe_archive(path)
-    except TemplateUnreadable as exc:
-        raise DocumentUnreadable(str(exc)) from exc
+    # Markdown is text, not an archive; the zip-bomb guard would reject every valid one.
+    if kind != "md":
+        try:
+            assert_safe_archive(path)
+        except TemplateUnreadable as exc:
+            raise DocumentUnreadable(str(exc)) from exc
 
-    readers = {"pptx": _read_pptx, "docx": _read_docx, "xlsx": _read_xlsx}
+    readers = {
+        "pptx": _read_pptx, "docx": _read_docx, "xlsx": _read_xlsx, "md": _read_md
+    }
     reader = readers.get(kind)
     if reader is None:
         raise DocumentUnreadable(f"cannot read a document of kind {kind!r}")
@@ -188,4 +192,55 @@ def _read_xlsx(path: Path, mode: ReadMode) -> dict[str, Any]:
         "sheets": sheets,
         "placeholders": find_placeholders(texts),
         "hint": "set_cell takes a sheet name and A1 notation, e.g. sheet='Data', cell='B7'.",
+    }
+
+
+def _read_md(path: Path, mode: ReadMode) -> dict[str, Any]:
+    """Report a Markdown file as numbered lines and a heading outline.
+
+    Lines, not paragraphs. Markdown's unit of address is the line — that is what an editor
+    shows and what a diff speaks — and set_line is far easier for a model to target
+    correctly than a paragraph index it would have to derive from blank-line grouping.
+
+    Fenced code is tracked so a `#` inside a shell snippet is not reported as a heading.
+    """
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+
+    headings: list[dict[str, Any]] = []
+    in_fence = False
+    fence: str | None = None
+    for number, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if in_fence:
+            if fence and stripped.startswith(fence):
+                in_fence, fence = False, None
+            continue
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence, fence = True, stripped[:3]
+            continue
+        if stripped.startswith("#"):
+            marker, _, title = stripped.partition(" ")
+            if set(marker) == {"#"} and title.strip():
+                headings.append(
+                    {"line": number, "level": len(marker), "text": _clip(title.strip(), mode)}
+                )
+
+    listed = [
+        {"line": number, "text": _clip(line, mode)}
+        for number, line in enumerate(lines, start=1)
+        if mode == "full" or line.strip()
+    ]
+
+    return {
+        "kind": "md",
+        "line_count": len(lines),
+        "lines": listed,
+        "headings": headings,
+        "placeholders": find_placeholders([text]),
+        "hint": (
+            "Line numbers are 1-based and count every line including blank ones, which "
+            "is what set_line and delete_lines expect. In outline mode blank lines are "
+            "omitted from this list but still counted."
+        ),
     }

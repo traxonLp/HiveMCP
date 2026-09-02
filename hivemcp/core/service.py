@@ -24,6 +24,7 @@ from .llm.resolver import ModelUnavailable, resolve_model
 from .models import DeckSpec, DocSpec, EditResult, RenderOptions, RenderResult, SheetSpec
 from .render.base import RenderedFile, RenderError
 from .render.docx import render_document
+from .render.markdown import render_markdown
 from .render.pptx import render_presentation
 from .render.theme import safe_filename
 from .render.xlsx import render_spreadsheet
@@ -51,7 +52,14 @@ def detect_kind(data: bytes) -> str | None:
         with zipfile.ZipFile(BytesIO(data)) as archive:
             names = set(archive.namelist())
     except zipfile.BadZipFile:
-        return None
+        # Not an archive, so it may still be Markdown. Decoding as UTF-8 is the test:
+        # arbitrary binary almost never decodes cleanly, and anything that does is text
+        # this server can at least read back safely.
+        try:
+            data.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        return "md"
     for marker, kind in _OOXML_MARKERS:
         if marker in names:
             return kind
@@ -141,6 +149,31 @@ class DocumentService:
         )
         return await self._deliver(rendered, caller, notes)
 
+    async def create_markdown(
+        self,
+        caller: Caller,
+        options: RenderOptions | None = None,
+        spec: DocSpec | None = None,
+        brief: str | None = None,
+    ) -> RenderResult:
+        """Render the same DocSpec as create_document, but as Markdown.
+
+        One spec for both: the block types already describe a document, and a second
+        model would only be a second thing to keep in step.
+        """
+        options = options or RenderOptions()
+        notes: list[str] = []
+        spec = await self._resolve_spec(
+            spec, brief, options, DocSpec, caller, "document", notes
+        )
+        template = self._template_path(options, caller)
+        resolver = self._image_resolver(caller)
+
+        rendered = await self._render(
+            render_markdown, spec, options, image_resolver=resolver, template_path=template
+        )
+        return await self._deliver(rendered, caller, notes)
+
     async def create_spreadsheet(
         self,
         caller: Caller,
@@ -221,8 +254,8 @@ class DocumentService:
         kind = detect_kind(data)
         if kind is None:
             raise ToolError(
-                "That file is not a PowerPoint, Word or Excel document. HiveMCP can only "
-                "read and edit .pptx, .docx and .xlsx files."
+                "That file is not a document HiveMCP can read. It handles .pptx, .docx, "
+                ".xlsx and Markdown text files."
             )
         return data, kind
 

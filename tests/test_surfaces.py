@@ -22,6 +22,7 @@ EXPECTED_TOOLS = {
     "hive_create_presentation",
     "hive_create_document",
     "hive_create_spreadsheet",
+    "hive_create_markdown",
     "hive_read_document",
     "hive_edit_document",
     "hive_list_templates",

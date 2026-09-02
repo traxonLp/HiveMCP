@@ -169,6 +169,8 @@ def test_unknown_id_says_how_to_find_the_real_ones(store: TemplateStore) -> None
         ("a.xlsx", "xlsx"),
         ("a.xltx", "xlsx"),
         ("a.PPTX", "pptx"),
+        ("a.md", "md"),
+        ("a.markdown", "md"),
     ],
 )
 def test_kind_for_accepts_documents_and_template_variants(

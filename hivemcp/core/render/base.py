@@ -9,6 +9,9 @@ MEDIA_TYPES = {
     "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    # text/markdown is the registered type (RFC 7763). charset matters: the renderer
+    # writes UTF-8, and without saying so a browser may guess latin-1 and mangle it.
+    "md": "text/markdown; charset=utf-8",
 }
 
 

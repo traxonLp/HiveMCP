@@ -35,7 +35,7 @@ from ..core.service import DocumentService, ToolError
 from ..core.skills import SkillError, SkillRegistry
 from ..core.templates.service import TemplateService
 from ..core.templates.store import NotPermitted, TemplateError, TemplateKind
-from .config_ui import ConfigKind, LanguageChoice, ThemeChoice, render_config_page
+from .config_ui import ConfigKind, LanguageChoice, render_config_page
 from .download_ui import render_download_card
 
 logger = logging.getLogger(__name__)
@@ -169,6 +169,33 @@ async def create_document(
     """
     try:
         return await service.create_document(
+            caller, options=body.options, spec=body.spec, brief=body.brief
+        )
+    except ToolError as exc:
+        raise _translate(exc) from exc
+
+
+@router.post(
+    "/create_markdown",
+    operation_id="hive_create_markdown",
+    summary="Create a Markdown file, README or notes document",
+    response_model=RenderResult,
+)
+async def create_markdown(
+    body: DocumentRequest, service: ServiceDep, caller: CallerDep
+) -> RenderResult:
+    """Create a real .md file the user can download.
+
+    Use this when someone asks for Markdown, a README, release notes, documentation for a
+    repository, or a file for a static-site generator. Takes the same `spec` as
+    hive_create_document — headings, paragraphs, lists, tables, code — so if you can build
+    one you can build the other.
+
+    Reach for Word instead when the result is meant to be printed, sent to someone who
+    does not read Markdown, or styled from a corporate template.
+    """
+    try:
+        return await service.create_markdown(
             caller, options=body.options, spec=body.spec, brief=body.brief
         )
     except ToolError as exc:
@@ -463,7 +490,6 @@ async def open_config(
     kind: ConfigKind = "pptx",
     topic: str = "",
     audience: str = "",
-    theme: ThemeChoice = "auto",
     language: LanguageChoice = "auto",
 ) -> HTMLResponse:
     """Show an interactive settings form in the chat.
@@ -488,7 +514,6 @@ async def open_config(
         kind,
         templates.list(caller),
         preferences=preferences,
-        theme=theme,
         language=language,
         prefill_topic=topic,
         prefill_audience=audience,

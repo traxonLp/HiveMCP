@@ -50,7 +50,7 @@ from ..core.templates.store import TemplateError, TemplateKind
 logger = logging.getLogger(__name__)
 
 INSTRUCTIONS = """\
-HiveMCP builds PowerPoint, Word and Excel files.
+HiveMCP builds PowerPoint, Word, Excel and Markdown files.
 
 Prefer passing a complete `spec`: you write the content, this server renders it
 deterministically. Keep bullets short, use the enum values the schema lists rather than
@@ -211,6 +211,29 @@ def build_mcp_server(
         try:
             caller = await _caller_from_context(validator, ctx)
             result = await service.create_document(
+                caller, options=options, spec=spec, brief=brief
+            )
+        except TOOL_ERRORS as exc:
+            return _error(exc)
+        return result.model_dump(exclude_none=True)
+
+    @mcp.tool(
+        name="hive_create_markdown",
+        description=(
+            "Create a real Markdown (.md) file the user can download. Use this for a "
+            "README, release notes, repository documentation or a post for a static-site "
+            "generator. Takes the same 'spec' as hive_create_document."
+        ),
+    )
+    async def create_markdown(
+        spec: DocSpec | None = None,
+        brief: str | None = None,
+        options: RenderOptions | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        try:
+            caller = await _caller_from_context(validator, ctx)
+            result = await service.create_markdown(
                 caller, options=options, spec=spec, brief=brief
             )
         except TOOL_ERRORS as exc:

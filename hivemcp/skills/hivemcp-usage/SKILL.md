@@ -1,12 +1,12 @@
 ---
 name: hivemcp-usage
-title: Using HiveMCP to build Office documents
-description: How to pick the right HiveMCP tool and write a spec it renders correctly. Read this before generating a presentation, document or spreadsheet.
+title: Using HiveMCP to build Office and Markdown documents
+description: How to pick the right HiveMCP tool and write a spec it renders correctly. Read this before generating a presentation, document, spreadsheet or Markdown file.
 ---
 
 # Using HiveMCP
 
-HiveMCP turns a **spec you write** into a real `.pptx`, `.docx` or `.xlsx` file. You
+HiveMCP turns a **spec you write** into a real `.pptx`, `.docx`, `.xlsx` or `.md` file. You
 supply the content; the server does the layout. It never invents content for a spec you
 passed, and it never silently drops a field it does not understand — an unknown field is
 a validation error you should fix and resend.
@@ -18,6 +18,7 @@ a validation error you should fix and resend.
 | slides, a deck, a presentation, `.pptx` | `hive_create_presentation` |
 | a report, letter, memo, manual, `.docx` | `hive_create_document` |
 | a table, workbook, budget, `.xlsx` | `hive_create_spreadsheet` |
+| a README, release notes, `.md` | `hive_create_markdown` |
 | to change a file they attached | `hive_read_document`, then `hive_edit_document` |
 | to see the corporate templates | `hive_list_templates` |
 | to choose fonts, template, length | `hive_open_config` |
@@ -47,6 +48,32 @@ Präsentation über Kaffee" wants a presentation, not a form.
 **`hive_show_download`** turns the `download_url` from a create or edit result into a
 real button. Call it straight afterwards. A URL inside a tool result is plain text the
 user cannot click, and warnings on the result are easy to miss.
+
+## Markdown
+
+`hive_create_markdown` takes the **same `spec` as `hive_create_document`** — the same
+blocks, the same rules. If you can build one you can build the other.
+
+Which to choose: Markdown for a README, release notes, repository documentation, or a
+post for a static-site generator. Word when the result will be printed, sent to someone
+who does not read Markdown, or styled from a corporate template.
+
+Three things behave differently because the format has no equivalent:
+
+- **No fonts, sizes, page size or orientation.** Setting them produces a warning and
+  nothing else. Markdown is plain text; the renderer that displays it decides.
+- **A `toc` block writes the entries out** as links, rather than a field the reader's
+  application fills in. `page_break` becomes a horizontal rule.
+- **Images are embedded as data URIs**, because Markdown has nowhere to put a companion
+  file. Large images make an unwieldy file and you get a warning saying so.
+
+`options.frontmatter` adds a YAML block with title, author and language. Turn it on for a
+static-site generator, leave it off for a plain README.
+
+A Markdown template is a `.md` file with `{{placeholders}}` and one `{{content}}` marker
+saying where the generated document goes. `hive_inspect_template` reports both, including
+whether the marker is missing — without it the body is appended, which is rarely what the
+author intended.
 
 ## Two ways to supply content
 
@@ -140,7 +167,7 @@ braces: `{"kunde": "Muster GmbH"}` fills `{{kunde}}`.
 ### Adding a template (administrators only)
 
 When an administrator attaches a `.pptx`, `.potx`, `.docx`, `.dotx`, `.xlsx` or `.xltx`
-and asks to keep it as a template, call `hive_upload_template` with the attached
+or `.md` and asks to keep it as a template, call `hive_upload_template` with the attached
 `file_id` and a short, human name — "Corporate Deck 2026", not "template1". The name
 becomes the id, so it is what everyone will type later. `hive_delete_template` removes
 one.
@@ -163,6 +190,11 @@ written at all.
 `warnings`. Relay that rather than reporting a change that did not happen.
 
 The original file is never modified. Edits come back as a new file.
+
+Markdown is addressed by **line**, not by paragraph: `hive_read_document` returns
+numbered lines and a heading outline, and `set_line` replaces one of them. Everything
+else — `replace_text`, `fill_placeholders`, `append_paragraph` — works the same as for
+Word.
 
 Paragraph numbers count every paragraph including empty ones. In `outline` mode empty
 paragraphs are omitted from the listing but still counted, so the numbers you see remain

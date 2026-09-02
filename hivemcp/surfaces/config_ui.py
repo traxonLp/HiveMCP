@@ -8,18 +8,20 @@ Three constraints from OpenWebUI's sandbox shape everything below:
 
 * **No forms.** ``allow-forms`` is off by default, so a ``<form>`` submission is blocked
   by the sandbox. The card uses a plain button and a click handler instead.
-* **The theme arrives through CSS, not through any API.** Nothing *tells* the card:
-  postMessage carries no appearance message, ``window.args`` needs ``allowSameOrigin``,
-  and OpenWebUI keeps the interface theme in the browser's localStorage rather than in
-  server-side settings. But it does not need to be told. ``prefers-color-scheme``
-  evaluated inside an iframe reports the colour scheme of the **embedding element**,
-  cross-origin included — the CSS Working Group resolved this deliberately. So the plain
-  media query already asks OpenWebUI what it looks like.
+* **The theme is read from the page, never from the server.** The card mirrors the
+  ``dark`` class OpenWebUI puts on its own ``<html>``, and falls back to
+  ``prefers-color-scheme`` when the parent document is out of reach. Both live in
+  :mod:`.theme_ui`, which explains why that order and not the other one.
 
-  This only works if the card declares ``color-scheme: light dark``. Declaring a single
-  scheme is what breaks it: an embedded document whose used scheme differs from its
-  embedder is given an *opaque* canvas, so a card pinned to light becomes a white
-  rectangle in a dark chat.
+  Whatever decides, the card must declare ``color-scheme: light dark`` on ``:root``.
+  Declaring a single scheme is what breaks embedding: a document whose used scheme
+  differs from its embedder is given an *opaque* canvas, so a card pinned to light
+  becomes a white rectangle in a dark chat.
+
+  Gone from earlier versions: a server-side guess from OpenWebUI's settings API, and an
+  in-card toggle to correct it. The guess pinned the card at render time, which is
+  precisely what stopped it following a theme switch, and the toggle only existed to fix
+  answers the parent sync now gets right.
 * **No callbacks.** Nothing inside can reach HiveMCP, so everything the card needs is
   inlined at render time and the only way out is ``postMessage``.
 
@@ -37,9 +39,9 @@ from markupsafe import Markup
 
 from ..core.preferences import UserPreferences
 from ..core.render.theme import CJK_FONTS, SAFE_FONTS
+from .theme_ui import PARENT_THEME_SYNC, dark_css
 
-ConfigKind = Literal["pptx", "docx", "xlsx"]
-ThemeChoice = Literal["auto", "light", "dark"]
+ConfigKind = Literal["pptx", "docx", "xlsx", "md"]
 LanguageChoice = Literal["auto", "en", "de", "zh-CN", "zh-TW"]
 
 # English is the default rather than the author's own language: this is a general tool,
@@ -80,6 +82,11 @@ STRINGS: dict[str, dict[str, str]] = {
         "pptx": "presentation",
         "docx": "document",
         "xlsx": "workbook",
+        "md": "Markdown file",
+        "unit_md": "sections",
+        "verb_md": "Create a Markdown file",
+        "frontmatter": "YAML front matter",
+        "frontmatter_note": "for Hugo, Jekyll and similar",
         "unit_pptx": "slides",
         "unit_docx": "pages",
         "verb_pptx": "Create a presentation",
@@ -87,7 +94,6 @@ STRINGS: dict[str, dict[str, str]] = {
         "verb_xlsx": "Create a workbook",
         "about": " about: ",
         "use_options": "Use these options (RenderOptions):",
-        "toggle_theme": "Switch light / dark",
     },
     "zh-CN": {
         "heading": "{kind}设置",
@@ -119,6 +125,11 @@ STRINGS: dict[str, dict[str, str]] = {
         "pptx": "演示文稿",
         "docx": "文档",
         "xlsx": "工作簿",
+        "md": "Markdown 文件",
+        "unit_md": "个章节",
+        "verb_md": "创建一个 Markdown 文件",
+        "frontmatter": "YAML 前置数据",
+        "frontmatter_note": "用于 Hugo、Jekyll 等",
         "unit_pptx": "张幻灯片",
         "unit_docx": "页",
         "verb_pptx": "创建一个演示文稿",
@@ -126,7 +137,6 @@ STRINGS: dict[str, dict[str, str]] = {
         "verb_xlsx": "创建一个工作簿",
         "about": "，主题：",
         "use_options": "使用以下选项（RenderOptions）：",
-        "toggle_theme": "切换浅色 / 深色",
     },
     "zh-TW": {
         "heading": "{kind}設定",
@@ -158,6 +168,11 @@ STRINGS: dict[str, dict[str, str]] = {
         "pptx": "簡報",
         "docx": "文件",
         "xlsx": "活頁簿",
+        "md": "Markdown 檔案",
+        "unit_md": "個章節",
+        "verb_md": "建立一個 Markdown 檔案",
+        "frontmatter": "YAML 前置資料",
+        "frontmatter_note": "用於 Hugo、Jekyll 等",
         "unit_pptx": "張投影片",
         "unit_docx": "頁",
         "verb_pptx": "建立一份簡報",
@@ -165,7 +180,6 @@ STRINGS: dict[str, dict[str, str]] = {
         "verb_xlsx": "建立一個活頁簿",
         "about": "，主題：",
         "use_options": "使用以下選項（RenderOptions）：",
-        "toggle_theme": "切換淺色 / 深色",
     },
     "de": {
         "heading": "{kind} konfigurieren",
@@ -199,6 +213,11 @@ STRINGS: dict[str, dict[str, str]] = {
         "pptx": "Präsentation",
         "docx": "Dokument",
         "xlsx": "Arbeitsmappe",
+        "md": "Markdown-Datei",
+        "unit_md": "Abschnitte",
+        "verb_md": "Markdown-Datei erstellen",
+        "frontmatter": "YAML-Frontmatter",
+        "frontmatter_note": "für Hugo, Jekyll und ähnliche",
         "unit_pptx": "Folien",
         "unit_docx": "Seiten",
         "verb_pptx": "Erstelle eine Präsentation",
@@ -206,7 +225,6 @@ STRINGS: dict[str, dict[str, str]] = {
         "verb_xlsx": "Erstelle eine Arbeitsmappe",
         "about": " zum Thema: ",
         "use_options": "Nutze diese Optionen (RenderOptions):",
-        "toggle_theme": "Hell / dunkel umschalten",
     },
 }
 
@@ -241,14 +259,7 @@ CONFIG_HTML = """<!DOCTYPE html>
     font: 14px/1.45 system-ui, -apple-system, "Segoe UI", "PingFang SC", "PingFang TC",
           "Microsoft YaHei", "Microsoft JhengHei", "Noto Sans CJK SC", sans-serif;
   }
-  .head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
   h1 { margin: 0 0 4px; font-size: 1.05rem; font-weight: 600; }
-  #theme-toggle {
-    margin: 0; width: auto; flex: none; padding: 3px 9px; border-radius: 6px;
-    background: transparent; color: var(--muted); border: 1px solid var(--border);
-    font-size: .95rem; line-height: 1.2; font-weight: 400;
-  }
-  #theme-toggle:hover { color: var(--fg); filter: none; }
   p.lead { margin: 0 0 16px; color: var(--muted); font-size: .85rem; }
   .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
   .full { grid-column: 1 / -1; }
@@ -274,11 +285,7 @@ CONFIG_HTML = """<!DOCTYPE html>
   .note { margin-top: 10px; font-size: .74rem; color: var(--muted); text-align: center; }
 </style></head>
 <body>
-  <div class="head">
-    <h1>{{ t.heading }}</h1>
-    <button type="button" id="theme-toggle" title="{{ t.toggle_theme }}"
-            aria-label="{{ t.toggle_theme }}">◐</button>
-  </div>
+  <h1>{{ t.heading }}</h1>
   <p class="lead">{{ t.lead }}</p>
 
   <!-- Deliberately plain fields rather than a form element: the sandbox blocks form
@@ -305,6 +312,7 @@ CONFIG_HTML = """<!DOCTYPE html>
       <input id="audience" placeholder="{{ t.audience_hint }}" value="{{ prefill_audience }}">
     </div>
 
+    {% if kind != "md" %}
     <div>
       <label for="font_family">{{ t.font }} <span class="hint">({{ t.font_note }})</span></label>
       <select id="font_family">
@@ -314,11 +322,14 @@ CONFIG_HTML = """<!DOCTYPE html>
         {% endfor %}
       </select>
     </div>
+    {% endif %}
 
+    {% if kind != "md" %}
     <div>
       <label for="font_size_base">{{ t.size }}</label>
       <input id="font_size_base" type="number" min="6" max="72" value="{{ default_size }}">
     </div>
+    {% endif %}
 
     {% if kind != "xlsx" %}
     <div>
@@ -333,6 +344,13 @@ CONFIG_HTML = """<!DOCTYPE html>
         <option value="normal" selected>{{ t.normal }}</option>
         <option value="dense">{{ t.dense }}</option>
       </select>
+    </div>
+    {% endif %}
+
+    {% if kind == "md" %}
+    <div class="full">
+      <label class="check"><input type="checkbox" id="frontmatter">
+        {{ t.frontmatter }} <span class="hint">({{ t.frontmatter_note }})</span></label>
     </div>
     {% endif %}
 
@@ -369,7 +387,7 @@ CONFIG_HTML = """<!DOCTYPE html>
       <label class="check"><input type="checkbox" id="include_notes"> {{ t.notes }}</label>
     </div>
     {% endif %}
-    {% if kind == "docx" %}
+    {% if kind in ["docx", "md"] %}
     <div class="full checks">
       <label class="check"><input type="checkbox" id="include_toc"> {{ t.toc }}</label>
     </div>
@@ -380,6 +398,7 @@ CONFIG_HTML = """<!DOCTYPE html>
   <p class="note">{{ t.confirm_note }}</p>
 
 <script>
+{{ theme_sync }}
   const VERB = {{ verb_json }};
   const ABOUT = {{ about_json }};
   const USE_OPTIONS = {{ use_options_json }};
@@ -400,33 +419,17 @@ CONFIG_HTML = """<!DOCTYPE html>
     return el.type === 'number' ? Number(raw) : raw;
   }
 
-  // The stylesheet already follows OpenWebUI, because prefers-color-scheme inside an
-  // iframe reports the embedder's colour scheme. This only exists for the case where an
-  // instance declares none, or where someone wants the card the other way round.
-  //
-  // matchMedia rather than getComputedStyle: with `color-scheme: light dark` the
-  // computed value is the declaration, "light dark", not the scheme actually in use.
-  function isDark() {
-    const explicit = document.documentElement.dataset.theme;
-    if (explicit) return explicit === 'dark';
-    return window.matchMedia('(prefers-color-scheme: dark)').matches;
-  }
-
-  document.getElementById('theme-toggle').addEventListener('click', function () {
-    const root = document.documentElement;
-    const dark = !isDark();
-    root.dataset.theme = dark ? 'dark' : 'light';
-    // Pin the scheme as well, so form controls and the canvas follow the override
-    // instead of staying with what the embedder asked for.
-    root.style.colorScheme = dark ? 'dark' : 'light';
-  });
+  // No theme code here on purpose. The card follows OpenWebUI through a plain CSS media
+  // query, and a media query is live by definition: when the embedder's colour scheme
+  // changes, the browser re-evaluates and repaints. Anything written in JavaScript could
+  // only listen for that same change and do by hand what the engine already did.
 
   document.getElementById('submit').addEventListener('click', function () {
     const topic = value('topic');
     const options = {};
     for (const key of ['template_id', 'font_family', 'font_size_base', 'audience',
                        'target_length', 'density', 'language', 'page_size',
-                       'orientation', 'include_notes', 'include_toc']) {
+                       'orientation', 'include_notes', 'include_toc', 'frontmatter']) {
       const v = value(key);
       if (v !== null) options[key] = v;
     }
@@ -443,50 +446,11 @@ CONFIG_HTML = """<!DOCTYPE html>
 </script>
 </body></html>"""
 
-DARK_VARIABLES = """color-scheme: dark;
-    --fg: #ececf1; --muted: #9ca3af; --border: #3f4147;
-    --field-bg: #2a2b30; --accent: #6366f1; --accent-fg: #ffffff;"""
-
-
-def dark_css(theme: str) -> Markup:
-    """Build the dark-theme rules for a known, unknown, or explicitly light theme.
-
-    The unknown case — the normal one — is not a guess. ``prefers-color-scheme`` inside
-    an iframe reports the colour scheme of the *embedding element*, cross-origin
-    included, which the CSS Working Group resolved deliberately. So this media query asks
-    OpenWebUI what it looks like, not the operating system, as long as OpenWebUI declares
-    a ``color-scheme`` (and falls back to the OS if it does not, which is the best
-    remaining answer anyway).
-
-    Every variant still lets ``data-theme`` on the root element win, so the in-card
-    toggle can override a wrong answer. It is a safety net now, not the mechanism.
-
-    Returned as finished CSS rather than a selector fragment: the media-query form needs
-    an extra closing brace, and patching that in after rendering is the kind of string
-    surgery that breaks the moment the stylesheet is edited.
-    """
-    dark_rule = f':root[data-theme="dark"] {{ {DARK_VARIABLES} }}'
-
-    if theme == "light":
-        return Markup(dark_rule)
-    if theme == "dark":
-        # Explicitly requested: pin it, and pin color-scheme too so the canvas stays
-        # opaque-free against a dark embedder.
-        return Markup(
-            f':root:not([data-theme="light"]) {{ color-scheme: dark; {DARK_VARIABLES} }}'
-        )
-    return Markup(
-        f'@media (prefers-color-scheme: dark) {{ :root:not([data-theme="light"]) '
-        f"{{ {DARK_VARIABLES} }} }}\n  {dark_rule}"
-    )
-
-
 def render_config_page(
     kind: ConfigKind,
     templates: list[dict[str, Any]],
     *,
     preferences: UserPreferences | None = None,
-    theme: ThemeChoice = "auto",
     language: LanguageChoice = "auto",
     prefill_topic: str = "",
     prefill_audience: str = "",
@@ -498,9 +462,6 @@ def render_config_page(
     # the other hand, is in the conversation and can see which language it is in.
     language = language if language != "auto" else preferences.language
     strings = STRINGS.get(language, STRINGS["en"])
-
-    # An explicit request wins over the stored preference, which wins over guessing.
-    resolved = theme if theme != "auto" else (preferences.theme or "auto")
     kind_label = strings[kind]
 
     return _env.from_string(CONFIG_HTML).render(
@@ -514,7 +475,8 @@ def render_config_page(
         default_font="Microsoft YaHei" if language.startswith("zh") else "Calibri",
         prefill_topic=prefill_topic,
         prefill_audience=prefill_audience,
-        dark_css=dark_css(resolved),
+        dark_css=dark_css(),
+        theme_sync=PARENT_THEME_SYNC,
         verb_json=js_literal(strings[f"verb_{kind}"]),
         about_json=js_literal(strings["about"]),
         use_options_json=js_literal(strings["use_options"]),

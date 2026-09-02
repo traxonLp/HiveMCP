@@ -113,6 +113,11 @@ jobs:
           sed -i "s|app.kubernetes.io/version: .*|app.kubernetes.io/version: \"$next\"|" \
             deploy/k8s/02-deployment.yaml
 
+          # The number under the logo in the README. Hand-maintained it went stale within
+          # two releases, and a version badge that lies is worse than none.
+          sed -i "s|<p align=\"center\"><strong>.*</strong></p>|<p align=\"center\"><strong>$next</strong></p>|" \
+            README.md
+
           git diff --stat
 
       - name: Log in to GHCR
@@ -150,7 +155,7 @@ jobs:
           next='${{ steps.version.outputs.next }}'
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add pyproject.toml deploy/k8s/02-deployment.yaml
+          git add pyproject.toml deploy/k8s/02-deployment.yaml README.md
           git commit -m "chore(release): v$next [skip ci]"
           git tag -a "v$next" -m "v$next"
           git push origin HEAD:main

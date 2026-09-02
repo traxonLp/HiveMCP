@@ -30,7 +30,7 @@ from typing import Literal, Protocol
 
 logger = logging.getLogger(__name__)
 
-TemplateKind = Literal["pptx", "docx", "xlsx"]
+TemplateKind = Literal["pptx", "docx", "xlsx", "md"]
 
 # The template variants (.potx/.dotx/.xltx) are the proper ones, but people
 # overwhelmingly have a normal document to hand, so both are accepted.
@@ -42,6 +42,11 @@ ALLOWED_EXTENSIONS: dict[str, TemplateKind] = {
     ".xlsx": "xlsx",
     ".xltx": "xlsx",
     ".xlsm": "xlsx",
+    # Markdown templates are plain text, not archives. Everything the store does —
+    # ownership, ids, metadata — is format-agnostic; only inspection differs, and that
+    # branches in inspect.py.
+    ".md": "md",
+    ".markdown": "md",
 }
 
 _SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")

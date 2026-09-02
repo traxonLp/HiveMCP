@@ -96,6 +96,12 @@ def find_placeholders(texts: list[str]) -> list[str]:
 
 
 def inspect_template(path: Path, kind: str) -> dict[str, Any]:
+    # Markdown templates are plain text. Running the zip-bomb guard over one would reject
+    # every single valid template, so the branch comes before it rather than inside the
+    # inspector table.
+    if kind == "md":
+        return inspect_markdown(path)
+
     assert_safe_archive(path)
     inspectors = {"pptx": inspect_pptx, "docx": inspect_docx, "xlsx": inspect_xlsx}
     inspector = inspectors.get(kind)
@@ -297,5 +303,61 @@ def inspect_xlsx(path: Path) -> dict[str, Any]:
         "hint": (
             "Sheet names are reused when a spec sheet has the same name. Values under "
             "'placeholders' were found in the first 50 rows of each sheet."
+        ),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Markdown
+# --------------------------------------------------------------------------- #
+
+
+def inspect_markdown(path: Path) -> dict[str, Any]:
+    """Report what a Markdown template offers.
+
+    Unlike the Office formats there is no layout to discover — a Markdown template is a
+    skeleton with holes. So what matters is which holes exist, and whether the template
+    says where the generated document should go.
+
+    ``{{content}}`` is that marker. Without it the body is appended, which is a
+    reasonable default but rarely what the author intended, so it is reported rather than
+    left to be discovered by looking at the output.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise TemplateUnreadable(
+            "this file is not readable as UTF-8 text. A Markdown template is a plain "
+            ".md file."
+        ) from exc
+
+    placeholders = [name for name in find_placeholders([text]) if name != "content"]
+    has_content_marker = "{{content}}" in text
+
+    frontmatter: list[str] = []
+    if text.lstrip().startswith("---"):
+        _, _, rest = text.lstrip().partition("---")
+        block, sep, _ = rest.partition("\n---")
+        if sep:
+            frontmatter = [
+                line.split(":", 1)[0].strip()
+                for line in block.splitlines()
+                if ":" in line and not line.startswith(" ")
+            ]
+
+    return {
+        "kind": "md",
+        "placeholders": placeholders,
+        "has_content_marker": has_content_marker,
+        "frontmatter_keys": frontmatter,
+        "size_bytes": len(text.encode("utf-8")),
+        "hint": (
+            "Fill the placeholders through spec.placeholders, keyed without the braces. "
+            + (
+                "The generated document replaces {{content}}."
+                if has_content_marker
+                else "This template has no {{content}} marker, so the generated document "
+                "is appended after it. Add {{content}} where the body belongs."
+            )
         ),
     }
